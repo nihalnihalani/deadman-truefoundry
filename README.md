@@ -109,11 +109,17 @@ Split-screen. LEFT = naive (raw Bedrock, in-process state). RIGHT = DEADMAN. Bot
 ---
 
 ## 🚀 Real mode (TrueFoundry + Bedrock)
-1. Sign up for TrueFoundry; create an **AI Gateway** with the 5-tier Bedrock fallback (config as YAML, `tfy apply`).
-2. Register your tools behind the **MCP Gateway**; set Cedar/OPA default-deny on `k8s.cordon_drain`/`asg.scale`/`github.revert_pr`; turn on the OTel audit log.
-3. Add **Guardrails** (Pre-Tool arg validation, Post-Tool result inspection) via AI Gateway → Controls → Guardrails (WHEN/FROM/HOOKS).
-4. Wire the **Agent Gateway** autonomy budget to the AI Gateway fallback-depth signal.
-5. Swap the mock clients in `deadman/ai_gateway.py` / `deadman/mcp_gateway.py` for the real OpenAI-compatible TFY endpoint + Bedrock. `.env` keys are in `.env.example`.
+Ready-to-edit configs ship in [`infra/`](./infra):
+1. **AI Gateway** — apply the 5-tier Bedrock fallback + latency-shed + semantic cache:
+   `tfy apply -f infra/ai_gateway.yaml` → exposes one virtual model `deadman-resilient-bedrock`.
+2. **MCP Gateway + Guardrails** — `tfy apply -f infra/guardrails.yaml` sets Cedar default-deny on
+   `k8s.cordon_drain`/`asg.scale`/`github.revert_pr`, the Pre/Post-Tool guardrails, the OTel audit
+   log, and the **Agent Gateway** autonomy-budget coupling (revoke destructive scope at fallback depth 2).
+3. Set `DEADMAN_MODE=real` + the keys in `.env.example`. `deadman/ai_gateway.py` then calls the
+   OpenAI-compatible gateway via `deadman/realmode.py`; tools route through `realmode.call_tool` (MCP Gateway).
+4. Run the webhook a PagerDuty/CloudWatch alarm hits: `uvicorn deadman.webhook:app --port 8080`.
+
+The mock and real paths share the same agent logic — only the gateway clients swap.
 
 ---
 

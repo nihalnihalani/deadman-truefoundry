@@ -1,0 +1,69 @@
+# TrueFoundry AI Gateway — the DEADMAN resilient brain.
+# Apply with:  tfy apply -f infra/ai_gateway.yaml
+# This defines a single "virtual model" (deadman-resilient-bedrock) whose fallback chain,
+# retries, latency-based routing, and semantic cache make every model call resilient.
+# Your code just calls model="deadman-resilient-bedrock" — the gateway does the rest.
+#
+# NOTE: field names below follow TrueFoundry's documented gateway config shape; verify
+# against your tenant's current schema (docs: truefoundry.com/docs/ai-gateway).
+
+name: deadman-resilient-bedrock
+type: gateway-virtual-model
+
+# ---- the Bedrock fallback chain (each tier tagged in the trace) ----
+targets:
+  - id: claude-use1                       # tier 0 — primary
+    provider: aws-bedrock
+    model: anthropic.claude-3-5-sonnet-20241022-v2:0
+    region: us-east-1
+    weight: 100
+    fallback_candidate: true
+  - id: claude-usw2                       # tier 1 — CROSS-REGION (the literal May 7-8 outage)
+    provider: aws-bedrock
+    model: anthropic.claude-3-5-sonnet-20241022-v2:0
+    region: us-west-2
+    fallback_candidate: true
+  - id: llama-usw2                        # tier 2 — CROSS-PROVIDER (still on Bedrock)
+    provider: aws-bedrock
+    model: meta.llama3-1-70b-instruct-v1:0
+    region: us-west-2
+    fallback_candidate: true
+  - id: mistral-usw2                      # tier 3
+    provider: aws-bedrock
+    model: mistral.mistral-large-2407-v1:0
+    region: us-west-2
+    fallback_candidate: true
+  - id: cohere-usw2                       # tier 4 — final live tier
+    provider: aws-bedrock
+    model: cohere.command-r-plus-v1:0
+    region: us-west-2
+    fallback_candidate: true
+
+# ---- routing: latency-based, so a SLOW region sheds before it ever hard-errors ----
+routing:
+  strategy: latency-based
+  health_checks: true
+  latency_budget_ms: 1500          # breach p99 -> shed to the next tier (graceful degradation)
+
+# ---- fallback: which status codes hand off to the next target ----
+fallback:
+  enabled: true
+  on_status_codes: [401, 403, 404, 429, 500, 502, 503]
+
+# ---- retries: absorb transient 429/5xx bursts before falling back ----
+retries:
+  num_attempts: 2
+  delay_ms: 200
+  on_status_codes: [429, 500, 502, 503]
+
+# ---- semantic cache: the "runbook brain" — answers when every live tier is down ----
+cache:
+  type: semantic
+  similarity_threshold: 0.92
+  ttl_seconds: 86400
+  serve_stale_on_total_outage: true   # last-resort answer instead of an error
+
+# ---- observability: emit the routing decision + cost on every request ----
+observability:
+  trace: true
+  emit: [backend_used, fallback_depth, retry_count, region, latency_ms, tokens, cost]

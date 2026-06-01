@@ -36,6 +36,11 @@ class AIGateway:
 
     def complete(self, prompt: str) -> Completion:
         """Try each tier in order; shed on outage OR latency-budget breach; cache last."""
+        if config.MODE == "real":
+            # The real TFY AI Gateway does fallback/retry/cache; we just call the virtual model.
+            from deadman import realmode
+            r = realmode.complete(prompt)
+            return Completion(r["text"], r["served_by"], tier=0, from_cache=False)
         for t in config.FALLBACK_CHAIN:
             healthy = self._tier_healthy(t)
             slow = self.chaos.latency_ms(t["tier"]) > config.P99_LATENCY_BUDGET_MS if self.chaos else False
