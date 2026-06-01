@@ -7,7 +7,7 @@
 # Web server
 fastapi>=0.110
 uvicorn[standard]>=0.29
-python-dotenv>=1.0
+python-dotenv>=1.2.2
 
 # SSE (Server-Sent Events for /api/demo/stream)
 sse-starlette>=1.6
