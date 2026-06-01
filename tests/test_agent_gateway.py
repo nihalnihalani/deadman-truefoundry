@@ -101,15 +101,19 @@ class TestAgentGateway:
         for tool in config.DESTRUCTIVE_TOOLS:
             assert tool in FULL_SCOPE, f"{tool} missing from FULL_SCOPE"
 
-    def test_revocation_re_evaluates_on_lower_depth(self):
-        """allowed_scope re-evaluates depth each call; depth=0 returns FULL_SCOPE
-        unless the kill-switch was tripped (which latches).  Revocation via depth
-        alone is NOT a latch — re-check with a healthy depth re-grants scope."""
+    def test_revocation_latches_on_lower_depth(self):
+        """Revocation LATCHES (monotonic): once destructive scope is revoked by depth,
+        a later healthy depth=0 call does NOT silently re-grant FULL_SCOPE. Reconstruct
+        the gateway to get a fresh FULL_SCOPE — this closes the leaky re-grant Raven flagged."""
         gw = AgentGateway()
         gw.allowed_scope(config.AUTONOMY_REVOKE_AT_DEPTH)   # revoke at high depth
-        # With a healthy depth the gate re-opens (no kill-switch)
+        # Even with a healthy depth the gate stays closed (latched revocation).
         scope_after = gw.allowed_scope(0)
-        assert scope_after == FULL_SCOPE
+        assert scope_after == READ_ONLY
+        assert gw.revoked is True
+        # A fresh gateway re-grants full scope.
+        fresh = AgentGateway()
+        assert fresh.allowed_scope(0) == FULL_SCOPE
 
     def test_kill_switch_latch_persists_across_depth_changes(self):
         """Once kill_switch tripped, calling allowed_scope(0) still returns READ_ONLY."""

@@ -36,7 +36,9 @@ class AgentGateway:
         """Revoke destructive authority once the brain has fallen back too far.
 
         Also returns READ_ONLY when the kill-switch has been tripped via
-        trip_kill_switch(). Both conditions latch independently.
+        trip_kill_switch(). Revocation LATCHES: once destructive scope is revoked
+        (by depth, kill-switch, or a prior call) it stays revoked for this gateway's
+        lifetime — a recovering brain cannot silently re-acquire destructive authority.
 
         Parameters
         ----------
@@ -46,7 +48,11 @@ class AgentGateway:
             stored in AIGateway.max_depth. The value is authoritative regardless of
             how it was obtained.
         """
-        if self._kill_switch_tripped or fallback_depth >= config.AUTONOMY_REVOKE_AT_DEPTH:
+        # Revocation LATCHES (monotonic): once destructive scope is revoked it never
+        # silently re-grants on a transient fallback-depth dip. Honor the already-latched
+        # self.revoked so a recovering brain cannot re-acquire destructive authority for
+        # the lifetime of this gateway instance (reconstruct AgentGateway() to reset).
+        if self._kill_switch_tripped or self.revoked or fallback_depth >= config.AUTONOMY_REVOKE_AT_DEPTH:
             self.revoked = True
             return READ_ONLY            # destructive verbs are gone
         return FULL_SCOPE

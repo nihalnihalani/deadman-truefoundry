@@ -15,6 +15,22 @@ Mode selection
                                    its own Idempotency-Key enforcement; the local
                                    audit-log dedup is an additional defense layer.
 
+Exactly-once model (honest, three layers of defense)
+----------------------------------------------------
+  1. Provider-side Idempotency-Key — PRIMARY guarantee, enforced by the TFY MCP
+     Gateway. A replayed call with the same key never re-runs the side effect
+     (returns 409 / idempotent_replay).
+  2. Race-safe durable claim ledger — DEFENSE-IN-DEPTH. The COMMIT step uses
+     AuditLog.claim_commit(key, tool), an ATOMIC check-and-write that closes the
+     check-then-act TOCTOU race: only one concurrent worker / replay can win the
+     claim for a given key; the loser is folded into SKIPPED_IDEMPOTENT. The cheap
+     is_committed() pre-check at the top of execute() is just a fast path; claim_commit
+     is the authoritative guard.
+  3. System-of-record reconcile on resume — after a kill mid-action (PENDING but not
+     COMMITTED), the resume path reconciles against the live system-of-record before
+     re-acting, so a side effect that already landed is never replayed (RealWorld;
+     owned by Anchor).
+
 Compatibility
 -------------
 GuardrailBlock, ScopeDenied, KillSignal, ToolResult, and MCPGateway are all
@@ -133,7 +149,11 @@ class MCPGateway:
         # Post-tool guardrail — no chaos flag in real mode.
         value = self._post_tool(tool, body)
 
-        self.audit.write({"status": "COMMITTED", "tool": tool, "key": key})
+        # Atomic claim — closes the check-then-act TOCTOU on COMMIT. Loser of a
+        # concurrent/replayed claim folds into SKIPPED_IDEMPOTENT (exactly-once).
+        won = self.audit.claim_commit(key, tool)
+        if not won:
+            return ToolResult("SKIPPED_IDEMPOTENT")
         return ToolResult("EXECUTED", value)
 
     # ── mock execution path (UNCHANGED behaviour) ─────────────────────────────
@@ -154,5 +174,12 @@ class MCPGateway:
             raise KillSignal(key)
 
         value = self._post_tool(tool, raw)
-        self.audit.write({"status": "COMMITTED", "tool": tool, "key": key})
+
+        # Atomic claim — closes the check-then-act TOCTOU on COMMIT. Loser of a
+        # concurrent/replayed claim folds into SKIPPED_IDEMPOTENT (exactly-once).
+        # NOTE: the KillSignal above fires BEFORE this point, so claim_commit is
+        # simply not reached on the kill path; resume reconcile (Anchor) handles it.
+        won = self.audit.claim_commit(key, tool)
+        if not won:
+            return ToolResult("SKIPPED_IDEMPOTENT")
         return ToolResult("EXECUTED", value)

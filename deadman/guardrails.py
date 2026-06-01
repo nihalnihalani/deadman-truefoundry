@@ -110,9 +110,11 @@ def post_tool_validate(tool: str, raw, *, corrupt: bool = False):
 
     Rules (match guardrails.yaml → catch-corrupt-tool-output):
     ① corrupt=True: caller (MCPGateway) explicitly signals chaos/corruption;
-      always block for cw.* / logs.* tools.
-    ② raw is a str: must parse as valid JSON and must not look truncated (unbalanced
-      braces).  A degraded CloudWatch / log API commonly returns partial payloads.
+      block for cw.* / logs.* tools only.
+    ② cw.*/logs.* str payloads: must parse as valid JSON and must not look truncated
+      (unbalanced braces).  A degraded CloudWatch / log API commonly returns partial
+      payloads.  NON-metrics tools (e.g. github.revert_pr) are NOT JSON-validated —
+      a plain-text success body is legitimate and must pass.
     """
     is_metrics_or_logs = tool.startswith(("cw.", "logs."))
 
@@ -122,8 +124,13 @@ def post_tool_validate(tool: str, raw, *, corrupt: bool = False):
             f"Post-Tool: corrupt/truncated output from {tool} — forcing re-fetch"
         )
 
-    # ② structural validation for string payloads
-    if isinstance(raw, str):
+    # ② structural validation for string payloads — METRICS/LOGS TOOLS ONLY.
+    # Non-metrics tools (e.g. github.revert_pr) may legitimately return a plain-text
+    # success body that is not JSON. Validating those would wrongly block AFTER the
+    # side effect ran but BEFORE the COMMIT, manufacturing the exact
+    # PENDING-not-COMMITTED state that enables double-execution. So we gate the
+    # structural check on cw./logs. tools only, exactly like the `corrupt` branch.
+    if is_metrics_or_logs and isinstance(raw, str):
         if not _is_balanced_json(raw) or _looks_truncated(raw):
             raise GuardrailBlock(
                 f"Post-Tool: result from {tool} failed JSON/truncation check — "

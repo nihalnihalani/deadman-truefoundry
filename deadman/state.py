@@ -72,6 +72,7 @@ class FileBackend:
         self.incident_id = incident_id
         self._state_path = _file_path(incident_id, "state.json")
         self._audit_path = _file_path(incident_id, "audit.jsonl")
+        self._lock_path = _file_path(incident_id, "lock")
 
     # ---- state ----
 
@@ -105,10 +106,36 @@ class FileBackend:
             for e in self.read_audit()
         )
 
+    # ---- atomic claim (exactly-once commit) ----
+
+    def claim_commit(self, key: str, tool: str = "") -> bool:
+        """Atomically write a COMMITTED record for `key` IFF none exists yet.
+
+        Race-safety: the entire (read_audit -> check committed -> append COMMITTED)
+        critical section runs under an exclusive fcntl.flock(LOCK_EX) on a per-incident
+        lock file ({STATE_DIR}/{incident_id}.lock). This closes the check-then-act TOCTOU
+        window for concurrent processes on the same host. The lock is always released in
+        the finally block.
+
+        Returns True if THIS call wrote the COMMITTED record (won the claim), False if a
+        COMMITTED record for `key` already existed (replay / losing process).
+        """
+        import fcntl  # POSIX advisory lock; lazy import keeps non-claim paths dependency-free
+        lock_f = open(self._lock_path, "w")
+        try:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            if self.is_committed(key):
+                return False  # someone already committed this key
+            self.append_audit({"status": "COMMITTED", "tool": tool, "key": key})
+            return True
+        finally:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+            lock_f.close()
+
     # ---- reset ----
 
     def reset(self):
-        for p in (self._state_path, self._audit_path):
+        for p in (self._state_path, self._audit_path, self._lock_path):
             if os.path.exists(p):
                 os.remove(p)
 
@@ -206,12 +233,28 @@ class DynamoDBBackend:
         )
         return list(resp.get("Items", []))
 
-    def is_committed(self, key: str) -> bool:
-        """Query for a COMMITTED record matching `key`.
+    def _commit_marker_sk(self, key: str) -> str:
+        return f"COMMIT#{key}"
 
-        Uses the GSI "KeyStatusIndex" (PK=key, SK=status) when available for O(1) lookup;
-        falls back to a linear scan of the partition's AUDIT items if the GSI is absent.
+    def is_committed(self, key: str) -> bool:
+        """Return True if a COMMITTED record exists for `key`.
+
+        Lookup order (cheapest first):
+          1. O(1) GetItem on the dedicated COMMIT#{key} marker item written by claim_commit.
+          2. GSI "KeyStatusIndex" (PK=key, SK=status) query, when provisioned.
+          3. Linear scan of the partition's AUDIT items (last-resort fallback).
         """
+        # 1) O(1) marker item
+        try:
+            resp = self._table.get_item(
+                Key={"PK": self.incident_id, "SK": self._commit_marker_sk(key)}
+            )
+            if resp.get("Item"):
+                return True
+        except self._ClientError:
+            pass
+
+        # 2) GSI hot path
         try:
             resp = self._table.query(
                 IndexName="KeyStatusIndex",
@@ -223,11 +266,43 @@ class DynamoDBBackend:
             )
             return resp.get("Count", 0) > 0
         except self._ClientError:
-            # GSI not provisioned: fall back to linear scan
+            # 3) GSI not provisioned: fall back to linear scan
             return any(
                 e.get("key") == key and e.get("status") == "COMMITTED"
                 for e in self.read_audit()
             )
+
+    # ---- atomic claim (exactly-once commit) ----
+
+    def claim_commit(self, key: str, tool: str = "") -> bool:
+        """Atomically claim the COMMITTED record for `key` via a conditional PutItem.
+
+        Race-safety: a single conditional PutItem of the marker item SK="COMMIT#{key}"
+        with ConditionExpression "attribute_not_exists(SK)" is atomic at the DynamoDB
+        layer — only one concurrent writer can succeed. On ConditionalCheckFailedException
+        the caller is a replay/loser and we return False. On success we ALSO append the
+        normal AUDIT#<seq> COMMITTED record so the postmortem trail stays complete, then
+        return True.
+        """
+        marker = {
+            "PK": self.incident_id,
+            "SK": self._commit_marker_sk(key),
+            "status": "COMMITTED",
+            "tool": tool,
+            "key": key,
+        }
+        try:
+            self._table.put_item(
+                Item=marker,
+                ConditionExpression="attribute_not_exists(SK)",
+            )
+        except self._ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return False  # already claimed by another writer / replay
+            raise
+        # Won the claim — append the postmortem audit record too.
+        self.append_audit({"status": "COMMITTED", "tool": tool, "key": key})
+        return True
 
     # ---- reset ----
 
@@ -319,6 +394,17 @@ class AuditLog:
 
     def is_committed(self, key: str) -> bool:
         return self._backend.is_committed(key)
+
+    def claim_commit(self, key: str, tool: str = "") -> bool:
+        """Atomically record a COMMITTED entry for `key` iff none exists; race-safe.
+
+        Returns True if this call won the claim (wrote the COMMITTED record), False if a
+        COMMITTED record for `key` already existed (replay/loser). Delegates to the backend:
+        FileBackend uses an exclusive fcntl flock; DynamoDBBackend uses a conditional PutItem.
+        The written entry is {"status":"COMMITTED","tool":tool,"key":key} so postmortem,
+        is_committed, and pending_keys keep working unchanged.
+        """
+        return self._backend.claim_commit(key, tool)
 
     def pending_keys(self) -> list[str]:
         entries = self._entries()

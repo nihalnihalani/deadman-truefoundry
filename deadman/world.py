@@ -75,8 +75,24 @@ class RealWorld:
     RealWorld's role is:
       1. Accept the *intent* record from MCPGateway after a confirmed side effect
          (MCPGateway calls world.revert_pr(pr, key) after the tool call succeeds).
-      2. Provide is_reverted() / count() / is_cordoned() queries backed first by the
-         in-memory intent log, then by the durable AuditLog if constructed with one.
+      2. Provide is_reverted() / count() / is_cordoned() reconciliation queries with a
+         three-layer escalation:
+           a. in-memory intent log (same-process, before audit flush);
+           b. durable AuditLog COMMITTED records (cross-process resume);
+           c. a READ-ONLY LIVE query to the actual system of record via the MCP Gateway,
+              when (a) and (b) are inconclusive AND config.TFY_MCP_GATEWAY_URL is set.
+              This makes "reconcile against the system-of-record before re-acting" REAL
+              for production rather than a hollow audit-log proxy.
+
+    Read-only MCP tools expected on the gateway (no side effects, idempotency_key prefixed
+    "readcheck::" so the gateway treats them as safe reads):
+      • "github.get_pr_state" {"pr": <pr>}  -> body indicating revert/merge state.
+          We treat the PR as reverted when the response body reports any of:
+          body["reverted"] is True, body["state"] in {"reverted","rolled_back"}, or
+          body["revert_pr"] (a revert PR number) is present.
+      • "k8s.describe" {"node": <node>}  -> body indicating cordon/drain state.
+          We treat the node as cordoned when body["cordoned"]/body["unschedulable"] is True
+          or body["spec"]["unschedulable"] is True.
 
     Usage (webhook / production path):
         audit = AuditLog(incident_id)
@@ -120,39 +136,72 @@ class RealWorld:
     # ---- system-of-record queries ----
 
     def is_reverted(self, pr: str) -> bool:
-        """Return True if pr was successfully reverted in this process or in the audit log."""
-        # In-memory check (covers the same-process path and resume before log flush)
+        """Return True if pr was reverted — in-memory, audit log, or LIVE system of record."""
+        # (a) In-memory check (same-process path and resume before log flush)
         if any(a == "revert_pr" and p == pr for (a, p, *_rest) in self._applied):
             return True
-        # Durable audit log check (covers cross-process resume)
+        # (b) Durable audit log check (cross-process resume)
         if self._audit_log is not None:
-            # Any COMMITTED record for a github.revert_pr key that references this pr
-            # means the revert was durably committed. We check the key format used by
-            # the commander: "incident-*::revert_pr::{pr}"
-            entries = self._audit_log._entries()
-            for e in entries:
+            for e in self._audit_log._entries():
                 if (
                     e.get("status") == "COMMITTED"
                     and e.get("tool") == "github.revert_pr"
                     and pr in e.get("key", "")
                 ):
                     return True
+        # (c) LIVE read-only query against the real system of record via the MCP Gateway.
+        body = self._live_query("github.get_pr_state", {"pr": pr}, "readcheck::" + pr)
+        if isinstance(body, dict):
+            if body.get("reverted") is True:
+                return True
+            if body.get("state") in ("reverted", "rolled_back"):
+                return True
+            if body.get("revert_pr"):
+                return True
         return False
 
     def is_cordoned(self, node: str) -> bool:
-        """Return True if the node was cordoned/drained in this process or in the audit log."""
+        """Return True if node was cordoned — in-memory, audit log, or LIVE system of record."""
+        # (a) In-memory check
         if any(a == "cordon_drain" and n == node for (a, n, *_rest) in self._applied):
             return True
+        # (b) Durable audit log check
         if self._audit_log is not None:
-            entries = self._audit_log._entries()
-            for e in entries:
+            for e in self._audit_log._entries():
                 if (
                     e.get("status") == "COMMITTED"
                     and e.get("tool") == "k8s.cordon_drain"
                     and node in e.get("key", "")
                 ):
                     return True
+        # (c) LIVE read-only query against the real cluster via the MCP Gateway.
+        body = self._live_query("k8s.describe", {"node": node}, "readcheck::" + node)
+        if isinstance(body, dict):
+            if body.get("cordoned") is True or body.get("unschedulable") is True:
+                return True
+            spec = body.get("spec")
+            if isinstance(spec, dict) and spec.get("unschedulable") is True:
+                return True
         return False
+
+    def _live_query(self, tool: str, args: dict, idempotency_key: str):
+        """Issue a READ-ONLY MCP gateway query; return the parsed body or None.
+
+        Only fires when config.TFY_MCP_GATEWAY_URL is configured. Any failure (no gateway,
+        network error, gateway error, unparseable body) falls back to None so callers keep
+        their prior audit-log behavior. The idempotency_key is "readcheck::"-prefixed so the
+        gateway treats this as a safe, replay-tolerant read with no side effects.
+        """
+        import deadman.config as config
+        if not config.TFY_MCP_GATEWAY_URL:
+            return None
+        try:
+            from deadman import realmode_mcp
+            result = realmode_mcp.call_tool(tool, args, idempotency_key=idempotency_key)
+            return result.get("body") if isinstance(result, dict) else None
+        except Exception:
+            # Live query unavailable/failed -> inconclusive; caller already tried audit log.
+            return None
 
     def count(self, action: str) -> int:
         """Count in-memory intent records for the given action.

@@ -16,11 +16,16 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
+import logging
+import os
 import uuid
 from typing import AsyncGenerator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -34,12 +39,30 @@ from deadman.commander import NaiveAgent, Deadman, REVERT_KEY
 from deadman.mcp_gateway import KillSignal
 from deadman.state import AuditLog
 
+logger = logging.getLogger("deadman.webhook")
+
+# ---------------------------------------------------------------------------
+# Security / feature flags (read directly from env — config.py is not ours).
+# ---------------------------------------------------------------------------
+# Optional shared secret. When set, POST /incident requires either:
+#   - Authorization: Bearer <secret>, OR
+#   - X-Deadman-Signature: <hex HMAC-SHA256 of the raw request body, keyed by secret>
+# When UNSET (mock/dev default) the endpoint is open so the demo + tests work.
+WEBHOOK_SECRET = os.getenv("DEADMAN_WEBHOOK_SECRET", "")
+
+# Demo/chaos endpoints are enabled by default ("1"); set "0" to disable them in
+# a real production deployment so they can't be hit there.
+DEMO_ENABLED = os.getenv("DEADMAN_ENABLE_DEMO", "1") != "0"
+
 # ---------------------------------------------------------------------------
 # App + CORS
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="DEADMAN — resilient incident commander")
 
+# CORS: localhost dev origins only. We authenticate with a bearer/HMAC secret,
+# not cookies, so credentials are NOT allowed (avoids the credentialed-wildcard
+# foot-gun) and methods/headers are explicit rather than wildcards.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -50,10 +73,52 @@ app.add_middleware(
         "http://127.0.0.1:5173",
         "http://127.0.0.1:8080",
     ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Deadman-Signature"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
+
+async def _verify_webhook_auth(request: Request) -> None:
+    """Verify the incident webhook is authenticated when DEADMAN_WEBHOOK_SECRET is set.
+
+    No secret configured -> open (mock/dev default; keeps demo + tests working).
+    Secret configured -> require ONE of:
+      * Authorization: Bearer <secret>
+      * X-Deadman-Signature: <hex HMAC-SHA256(raw_body, secret)>  (PagerDuty/CloudWatch sign payloads)
+    Raises HTTPException(401) on mismatch.
+    """
+    if not WEBHOOK_SECRET:
+        return
+
+    # 1) Bearer token (constant-time compare).
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[len("Bearer "):]
+        if hmac.compare_digest(token, WEBHOOK_SECRET):
+            return
+
+    # 2) HMAC signature over the raw body.
+    sig = request.headers.get("x-deadman-signature", "")
+    if sig:
+        raw = await request.body()
+        expected = hmac.new(WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+        # tolerate an optional "sha256=" prefix some signers use
+        provided = sig.split("=", 1)[1] if sig.startswith("sha256=") else sig
+        if hmac.compare_digest(provided, expected):
+            return
+
+    raise HTTPException(status_code=401, detail="invalid or missing webhook authentication")
+
+
+def _require_demo_enabled() -> None:
+    """Block demo/chaos endpoints when DEADMAN_ENABLE_DEMO=0 (production)."""
+    if not DEMO_ENABLED:
+        raise HTTPException(status_code=404, detail="demo endpoints are disabled")
 
 # ---------------------------------------------------------------------------
 # OTel init (no-op when OTEL not configured)
@@ -61,8 +126,6 @@ app.add_middleware(
 from deadman.otel import init_otel  # noqa: E402
 
 init_otel(app)
-
-import os as _os  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Server-held demo Chaos state (used by /api/chaos/{toggle})
@@ -83,7 +146,7 @@ class Incident(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _scoreboard_dict(sb, incident_id: str | None = None) -> dict:
+def _scoreboard_dict(sb, incident_id: str | None = None, summary: str | None = None) -> dict:
     """Serialise a Scoreboard to the canonical JSON shape."""
     d: dict = {
         "survived": sb.survived,
@@ -97,7 +160,14 @@ def _scoreboard_dict(sb, incident_id: str | None = None) -> dict:
     }
     if incident_id:
         d["incident_id"] = incident_id
+    if summary is not None:
+        d["summary"] = summary
     return d
+
+
+def _run_incident(incident_id: str) -> "Scoreboard":  # type: ignore[name-defined]
+    """Blocking agent run, offloaded to a worker thread by the handler."""
+    return Deadman(incident_id, World(), chaos=None).run()
 
 
 # ---------------------------------------------------------------------------
@@ -116,10 +186,24 @@ def healthz():
 
 
 @app.post("/incident")
-def handle_incident(inc: Incident):
-    agent = Deadman(inc.incident_id, World(), chaos=None)
-    sb = agent.run()
-    return _scoreboard_dict(sb, inc.incident_id)
+async def handle_incident(inc: Incident, request: Request):
+    # Optional shared-secret auth (no-op when DEADMAN_WEBHOOK_SECRET is unset).
+    await _verify_webhook_auth(request)
+
+    # Structured log of the incoming alert summary so the alert text is recorded.
+    # NOTE: the summary is echoed back and logged here; full prompt-wiring (feeding
+    # the alert text into the commander's diagnosis prompt) is a follow-up — it
+    # requires a Deadman.run() signature change owned by Anchor, so we do NOT claim
+    # it currently drives diagnosis.
+    logger.info(
+        "incident received", extra={"incident_id": inc.incident_id, "summary": inc.summary}
+    )
+
+    # The agent's model/tool calls block (real-mode retries sleep up to a few
+    # seconds); offload to a worker thread so the event loop stays responsive
+    # during a 5xx storm. Mock-mode behaviour is identical.
+    sb = await run_in_threadpool(_run_incident, inc.incident_id)
+    return _scoreboard_dict(sb, inc.incident_id, summary=inc.summary)
 
 
 # ---------------------------------------------------------------------------
@@ -165,10 +249,15 @@ def _run_deadman_demo() -> "Scoreboard":  # type: ignore[name-defined]
     return Deadman(incident_id, world, chaos).run(resume=True)
 
 
+def _run_demo_both():
+    """Run both demo agents (blocking); offloaded to a worker thread."""
+    return _run_naive_demo(), _run_deadman_demo()
+
+
 @app.post("/api/demo/run")
-def demo_run():
-    naive = _run_naive_demo()
-    dead = _run_deadman_demo()
+async def demo_run():
+    _require_demo_enabled()
+    naive, dead = await run_in_threadpool(_run_demo_both)
     return {
         "naive": _scoreboard_dict(naive),
         "deadman": _scoreboard_dict(dead),
@@ -237,9 +326,10 @@ async def _sse_demo_generator(fast: bool) -> AsyncGenerator[str, None]:
         "mode": config.MODE,
     }
 
-    # Run the real agents in the background to get final scoreboards.
-    naive_final = _run_naive_demo()
-    dead_final = _run_deadman_demo()
+    # Run the real agents (blocking) on a worker thread to get final scoreboards
+    # without blocking the event loop while the SSE stream is paced out.
+    naive_final = await run_in_threadpool(_run_naive_demo)
+    dead_final = await run_in_threadpool(_run_deadman_demo)
 
     def _emit(beat_dict: dict) -> str:
         return "data: " + json.dumps(beat_dict) + "\n\n"
@@ -316,6 +406,7 @@ async def _sse_demo_generator(fast: bool) -> AsyncGenerator[str, None]:
 @app.get("/api/demo/stream")
 async def demo_stream(fast: int = 0):
     """Server-Sent Events replay of the demo, beat by beat."""
+    _require_demo_enabled()
     return StreamingResponse(
         _sse_demo_generator(fast=bool(fast)),
         media_type="text/event-stream",
@@ -351,8 +442,8 @@ def _chaos_state_dict(c: Chaos) -> dict:
 @app.post("/api/chaos/{toggle}")
 def chaos_toggle(toggle: str):
     global _demo_chaos
+    _require_demo_enabled()
     if toggle not in _VALID_TOGGLES:
-        from fastapi import HTTPException
         raise HTTPException(
             status_code=400,
             detail=f"Unknown toggle '{toggle}'. Valid: {sorted(_VALID_TOGGLES)}",
@@ -378,6 +469,6 @@ def chaos_toggle(toggle: str):
 # Static UI mount (web/ served at /) — MUST be last so API routes win.
 # Guarded: won't crash if web/ doesn't exist yet.
 # ---------------------------------------------------------------------------
-_web_dir = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "web")
-if _os.path.isdir(_web_dir):
+_web_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "web")
+if os.path.isdir(_web_dir):
     app.mount("/", StaticFiles(directory=_web_dir, html=True), name="ui")

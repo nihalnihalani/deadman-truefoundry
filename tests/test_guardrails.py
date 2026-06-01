@@ -146,16 +146,28 @@ class TestPostToolGuardrail:
         with pytest.raises(GuardrailBlock):
             post_tool_validate("logs.query", '{"result": "ok"}', corrupt=True)
 
-    def test_corrupt_flag_on_non_metrics_tool_does_not_block_via_corrupt(self):
+    def test_corrupt_flag_on_non_metrics_tool_does_not_block(self):
         """corrupt=True on github.revert_pr: the corrupt branch only fires for cw./logs.*.
-        However, a plain non-JSON string still triggers the structural string check.
-        Pass a non-string value to verify the corrupt path is skipped."""
-        # Passing a dict — corrupt=True does not affect non-metrics tools for dict payloads
+        A non-metrics tool result must pass regardless of the corrupt flag or payload shape."""
+        # Dict payload passes.
         result = post_tool_validate("github.revert_pr", {"status": "reverted"}, corrupt=True)
         assert result == {"status": "reverted"}
 
-    def test_invalid_json_string_raises(self):
-        """A non-JSON string raises GuardrailBlock via structural validation."""
+    def test_non_metrics_plaintext_string_passes(self):
+        """A destructive/non-metrics tool returning a plain-text success body must PASS.
+
+        Structural JSON validation is gated to cw./logs.* tools only; validating a
+        non-metrics plain-text body would wrongly block AFTER the side effect ran but
+        BEFORE the COMMIT — the exact PENDING-not-COMMITTED state that enables
+        double-execution. So github.revert_pr returning 'Reverted PR #42' must pass."""
+        result = post_tool_validate("github.revert_pr", "Reverted PR #42 successfully")
+        assert result == "Reverted PR #42 successfully"
+        # Even with corrupt=True (only meaningful for metrics/logs), it must pass.
+        result2 = post_tool_validate("k8s.cordon_drain", "node n1 cordoned", corrupt=True)
+        assert result2 == "node n1 cordoned"
+
+    def test_invalid_json_string_on_metrics_raises(self):
+        """A non-JSON string from a cw.* metrics tool raises GuardrailBlock."""
         with pytest.raises(GuardrailBlock):
             post_tool_validate("cw.get_metrics", "this is not json")
 

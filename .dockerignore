@@ -15,6 +15,10 @@ venv
 env
 .env.local
 
+# Tests + docs — not needed in the runtime image
+tests/
+docs/
+
 # Test artefacts
 .pytest_cache
 .mypy_cache

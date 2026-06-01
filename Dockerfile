@@ -10,11 +10,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application source
-COPY deadman/ ./deadman/
-COPY scripts/ ./scripts/
-COPY infra/ ./infra/
-# web/ is optional (built by Beacon); copy if present
+# Copy application source. .dockerignore excludes .git, .deadman_state/, tests/,
+# docs/, __pycache__, .env, *.pyc, .venv so the image stays minimal.
 COPY . .
 
 # Drop to non-root
