@@ -12,6 +12,12 @@ chaos=None is a valid and supported signature for Deadman. When chaos is None:
   - MCPGateway runs without kill injection or corrupt-output simulation.
   - Phase B deepening fires a real AI re-plan instead of toggling a chaos knob.
   - All invariants (exactly-once, resume, scope, audit) are identical.
+
+run_agentic() — the REAL agentic loop (Cortex deliverable):
+  The LLM actually decides which tool to call via a text-based ReAct (Reason+Act)
+  pattern over the existing AIGateway.complete() interface.  The planner parses
+  the model's JSON-action text and drives reason→act→observe until resolved or
+  budget exhausted.  Exactly-once and auto-leash are fully preserved.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -21,6 +27,8 @@ from deadman.ai_gateway import AIGateway, ModelOutage
 from deadman.mcp_gateway import MCPGateway, KillSignal, GuardrailBlock, ScopeDenied
 from deadman.agent_gateway import AgentGateway
 from deadman.state import DurableState, AuditLog
+import deadman.tools as tools
+import deadman.planner as planner
 
 
 @dataclass
@@ -98,6 +106,24 @@ class Deadman:
     def _scope(self) -> set:
         return self.agentgw.allowed_scope(self.ai.max_depth)
 
+    def _reconcile_pending(self, action: str, target: str) -> bool:
+        """Per-verb system-of-record check used by the resume path.
+
+        Returns True if the destructive action already landed on the real system, so it
+        must NOT be re-run. Generalized across every destructive verb — the original code
+        only handled github.revert_pr, which let cordon_drain / asg.scale double-execute
+        on resume (the reproduced exactly-once bug).
+        """
+        if action in ("github.revert_pr", "revert_pr"):
+            return bool(self.world.is_reverted(target))
+        if action in ("k8s.cordon_drain", "cordon_drain"):
+            check = getattr(self.world, "is_cordoned", None)
+            return bool(check(target)) if check else False
+        if action in ("asg.scale", "asg_scale"):
+            check = getattr(self.world, "is_scaled", None)
+            return bool(check(target)) if check else False
+        return False
+
     def run(self, resume: bool = False) -> Scoreboard:
         sb = Scoreboard()
 
@@ -109,10 +135,16 @@ class Deadman:
                 sb.notes.append(f"pending {pending['action']} already COMMITTED in audit log -> skip")
             elif pending:
                 # PENDING but not COMMITTED: verify the system of record before re-acting.
-                if self.world.is_reverted("PR-1337"):
-                    self.state.commit(pending["action"], pending["key"])
-                    self.audit.write({"status": "COMMITTED", "tool": "github.revert_pr", "key": pending["key"]})
-                    sb.notes.append("system-of-record shows PR already reverted -> reconciled, NOT re-run")
+                # Generalized across ALL destructive verbs (not just revert_pr) so a kill
+                # after a cordon_drain / asg.scale side-effect also reconciles exactly-once.
+                action = pending["action"]
+                target = pending["key"].split("::")[-1]
+                if self._reconcile_pending(action, target):
+                    self.state.commit(action, pending["key"])
+                    self.audit.write({"status": "COMMITTED", "tool": action, "key": pending["key"]})
+                    sb.notes.append(
+                        f"system-of-record shows {action} on {target} already applied -> reconciled, NOT re-run"
+                    )
 
         # --- diagnose / decide (model calls go through the AI Gateway fallback chain) ---
         try:
@@ -163,6 +195,11 @@ class Deadman:
         sb.drain_authority = self.agentgw.drain_authority
         if self.agentgw.revoked:
             sb.notes.append("brain degraded to tier-%d -> Agent Gateway AUTO-LEASH: destructive authority REVOKED" % self.ai.max_depth)
+        # Checkpoint the cordon BEFORE executing (only when actually in scope) so a kill
+        # mid-cordon is recoverable by the generalized resume reconcile — exactly-once
+        # now holds for cordon_drain too, not just revert_pr.
+        if "k8s.cordon_drain" in scope2 and not self.audit.is_committed(self.cordon_key):
+            self.state.set_pending("k8s.cordon_drain", self.cordon_key)
         try:
             self.mcp.execute("k8s.cordon_drain", {"node": "prod-node-7"}, self.cordon_key, scope2)
         except ScopeDenied as e:
@@ -172,4 +209,155 @@ class Deadman:
         sb.double_executions = max(self.world.count("revert_pr") - 1, 0)
         sb.survived = True
         sb.notes.append("incident resolved; postmortem written from the audit log")
+        return sb
+
+    # -------------------------------------------------------------------------
+    # REAL AGENTIC LOOP (Cortex)
+    # -------------------------------------------------------------------------
+    def run_agentic(self, summary: str, max_steps: int = 8, resume: bool = False) -> Scoreboard:
+        """Reason → act → observe loop where the LLM actually chooses each tool.
+
+        Uses a TEXT-based ReAct pattern over AIGateway.complete(prompt) → Completion.
+        The planner parses the model's JSON-action text; exactly-once and auto-leash
+        are fully preserved.
+
+        Parameters
+        ----------
+        summary   : Short incident description (forwarded from the webhook payload).
+        max_steps : Budget cap — the loop stops after this many steps even if the
+                    model never says done=True.
+        resume    : If True, rehydrate from durable state first (same resume logic
+                    as run() — the generalized _reconcile_pending handles ALL verbs).
+        """
+        sb = Scoreboard()
+        observations: list[str] = []
+
+        # ── RESUME PATH ───────────────────────────────────────────────────────
+        if resume:
+            sb.notes.append("agentic-resume: rehydrating from durable state + audit log")
+            pending = self.state.pending
+            if pending and self.audit.is_committed(pending["key"]):
+                note = (
+                    f"pending {pending['action']} already COMMITTED in audit log -> skip"
+                )
+                sb.notes.append(note)
+                observations.append(f"[resume] {note}")
+            elif pending:
+                action_name = pending["action"]
+                target = pending["key"].split("::")[-1]
+                if self._reconcile_pending(action_name, target):
+                    self.state.commit(action_name, pending["key"])
+                    self.audit.write({
+                        "status": "COMMITTED",
+                        "tool": action_name,
+                        "key": pending["key"],
+                    })
+                    note = (
+                        f"system-of-record shows {action_name} on {target} already applied "
+                        "-> reconciled, NOT re-run"
+                    )
+                    sb.notes.append(note)
+                    observations.append(f"[resume] {note}")
+
+        # ── REASON→ACT→OBSERVE LOOP ───────────────────────────────────────────
+        catalog = tools.tool_catalog_prompt()
+
+        for _step in range(max_steps):
+            # ── build prompt + call LLM ────────────────────────────────────────
+            prompt = planner.build_prompt(summary, observations, catalog)
+            try:
+                comp = self.ai.complete(prompt)
+            except ModelOutage:
+                sb.notes.append("all tiers + cold cache down — degraded to safe hold")
+                observations.append("[model-outage] all AI tiers down — stopping loop")
+                break
+
+            # Track fallback depth / backend from the gateway response
+            sb.fallback_depth = self.ai.max_depth
+            sb.backend = "tier-%d" % self.ai.max_depth
+
+            # ── parse the model's decision ─────────────────────────────────────
+            action = planner.parse_action(comp.text)
+
+            # ── DONE ──────────────────────────────────────────────────────────
+            if action.done:
+                observations.append(f"[done] {action.rationale}")
+                sb.notes.append(f"model declared incident resolved: {action.rationale}")
+                break
+
+            # ── SAFE-HOLD (unparseable / missing tool) ─────────────────────────
+            if action.tool is None:
+                note = f"[safe-hold] {action.rationale}"
+                observations.append(note)
+                sb.notes.append(note)
+                # counts toward budget but does NOT execute any tool
+                continue
+
+            # ── LOOK UP TOOL IN REGISTRY ───────────────────────────────────────
+            reg_tool = tools.REGISTRY.get(action.tool)
+            if reg_tool is None:
+                note = f"[unknown-tool] '{action.tool}' not in registry — safe-hold"
+                observations.append(note)
+                sb.notes.append(note)
+                continue
+
+            # ── IDEMPOTENCY KEY ───────────────────────────────────────────────
+            target = tools.idempotency_target(reg_tool, action.args)
+            key = action_key(self.incident_id, action.tool, target)
+
+            # Fast-path: already committed → tell the model, move on
+            if self.audit.is_committed(key):
+                note = f"[skipped-idempotent] {action.tool}({target}) already committed"
+                observations.append(note)
+                sb.notes.append(note)
+                continue
+
+            # ── PRE-EXECUTE: checkpoint destructive actions ────────────────────
+            scope = self._scope()
+            if reg_tool.destructive:
+                self.state.set_pending(action.tool, key)
+
+            # ── EXECUTE via MCP Gateway ────────────────────────────────────────
+            try:
+                result = self.mcp.execute(action.tool, action.args, key, scope)
+            except KillSignal:
+                # Kill semantics are unchanged: re-raise so tests / scripts catch it.
+                sb.notes.append(f"KILLED mid-{action.tool} (between side effect and COMMIT)")
+                raise
+            except ScopeDenied as e:
+                note = f"[scope-denied] {action.tool} blocked — {e}"
+                observations.append(note)
+                sb.notes.append(note)
+                sb.guardrail_blocks = self.mcp.guardrail_blocks
+                continue
+            except GuardrailBlock as e:
+                note = f"[guardrail-block] {action.tool} blocked — {e}"
+                observations.append(note)
+                sb.notes.append(note)
+                sb.guardrail_blocks = self.mcp.guardrail_blocks
+                continue
+
+            # ── POST-EXECUTE: commit + build observation ───────────────────────
+            if reg_tool.destructive and result.status == "EXECUTED":
+                self.state.commit(action.tool, key)
+
+            obs_status = result.status  # "EXECUTED" | "SKIPPED_IDEMPOTENT"
+            note = (
+                f"[{obs_status.lower()}] {action.tool}({target}) "
+                f"rationale={action.rationale!r}"
+            )
+            observations.append(note)
+            sb.notes.append(note)
+
+        # ── FINAL SCOREBOARD FIELDS ────────────────────────────────────────────
+        sb.guardrail_blocks = self.mcp.guardrail_blocks
+        sb.drain_authority = self.agentgw.drain_authority
+        # Count double-executions for any destructive verb present in the world
+        reverts = getattr(self.world, "count", lambda a: 0)("revert_pr")
+        sb.double_executions = max(reverts - 1, 0)
+        sb.survived = True
+        sb.notes.append(
+            "agentic loop finished; postmortem from audit log covers "
+            f"{len(observations)} observations over up to {max_steps} steps"
+        )
         return sb

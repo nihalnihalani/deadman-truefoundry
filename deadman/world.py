@@ -59,6 +59,12 @@ class World:
     def is_reverted(self, pr: str) -> bool:
         return any(a == "revert_pr" and p == pr for (a, p, *_rest) in self.applied)
 
+    def is_cordoned(self, node: str) -> bool:
+        return any(a == "cordon_drain" and n == node for (a, n, *_rest) in self.applied)
+
+    def is_scaled(self, asg: str) -> bool:
+        return any(a == "asg_scale" and x == asg for (a, x, *_rest) in self.applied)
+
     def count(self, action: str) -> int:
         return sum(1 for rec in self.applied if rec[0] == action)
 
@@ -182,6 +188,20 @@ class RealWorld:
             spec = body.get("spec")
             if isinstance(spec, dict) and spec.get("unschedulable") is True:
                 return True
+        return False
+
+    def is_scaled(self, asg: str) -> bool:
+        """Return True if asg was scaled — in-memory or durable audit log."""
+        if any(a == "asg_scale" and x == asg for (a, x, *_rest) in self._applied):
+            return True
+        if self._audit_log is not None:
+            for e in self._audit_log._entries():
+                if (
+                    e.get("status") == "COMMITTED"
+                    and e.get("tool") == "asg.scale"
+                    and asg in e.get("key", "")
+                ):
+                    return True
         return False
 
     def _live_query(self, tool: str, args: dict, idempotency_key: str):

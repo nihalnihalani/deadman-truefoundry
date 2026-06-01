@@ -1,0 +1,16 @@
+apiVersion: v2
+name: deadman
+description: DEADMAN incident-commander — resilient agentic service with TrueFoundry AI/MCP Gateway + AWS Bedrock.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - deadman
+  - incident-commander
+  - truefoundry
+  - bedrock
+home: https://github.com/deadman-truefoundry
+sources:
+  - https://github.com/deadman-truefoundry/deadman-truefoundry
+maintainers:
+  - name: deadman-team

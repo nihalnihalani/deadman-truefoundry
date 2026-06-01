@@ -1,0 +1,162 @@
+# DEADMAN Helm chart — default values
+# Override with: helm install deadman ./deploy/helm -f my-values.yaml
+# Or per-key:    helm install deadman ./deploy/helm --set image.tag=abc1234
+
+# ---------------------------------------------------------------------------
+# Image
+# ---------------------------------------------------------------------------
+image:
+  repository: REPLACE_WITH_YOUR_REGISTRY/deadman
+  tag: latest           # pin to a SHA or semver tag in production
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []    # e.g. [{name: "regcred"}]
+
+# ---------------------------------------------------------------------------
+# Deployment
+# ---------------------------------------------------------------------------
+replicaCount: 2         # minimum 2 for HA in production; matched by HPA.minReplicas
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ---------------------------------------------------------------------------
+# Service
+# ---------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 8080
+  targetPort: 8080
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+# DEADMAN is I/O-bound (Bedrock latency); keep CPU request low, memory covers
+# the model client + state caches.
+resources:
+  requests:
+    cpu: "250m"
+    memory: "256Mi"
+  limits:
+    cpu: "1000m"
+    memory: "512Mi"
+
+# ---------------------------------------------------------------------------
+# Autoscaling (HPA)
+# ---------------------------------------------------------------------------
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 60
+
+# ---------------------------------------------------------------------------
+# PodDisruptionBudget
+# ---------------------------------------------------------------------------
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1       # always keep at least 1 pod during node drains/rolling updates
+
+# ---------------------------------------------------------------------------
+# Health probes
+# ---------------------------------------------------------------------------
+livenessProbe:
+  path: /healthz
+  initialDelaySeconds: 15
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  path: /readyz
+  initialDelaySeconds: 10
+  periodSeconds: 15
+  timeoutSeconds: 5
+  failureThreshold: 2
+
+# ---------------------------------------------------------------------------
+# Security context
+# ---------------------------------------------------------------------------
+# Matches non-root USER deadman in the Dockerfile.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  fsGroup: 1001
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false   # file-backend writes to /app/.deadman_state; set true only when using dynamodb backend
+  capabilities:
+    drop:
+      - ALL
+
+# ---------------------------------------------------------------------------
+# Service account
+# ---------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: ""              # leave empty to auto-generate from chart name
+  annotations: {}       # add IRSA annotation here:
+                        #   eks.amazonaws.com/role-arn: "arn:aws:iam::ACCOUNT:role/deadman-role"
+
+# ---------------------------------------------------------------------------
+# Non-secret environment (ConfigMap)
+# ---------------------------------------------------------------------------
+env:
+  DEADMAN_MODE: "real"
+  DEADMAN_ENABLE_DEMO: "0"
+  DEADMAN_STATE_BACKEND: "dynamodb"
+  DEADMAN_DYNAMODB_TABLE: "deadman-incident-state"
+  TFY_RESILIENT_MODEL: "deadman-resilient-bedrock"
+  TFY_METADATA: "app=deadman,role=incident-commander"
+  AWS_REGION: "us-east-1"
+  AWS_FALLBACK_REGION: "us-west-2"
+  OTEL_SERVICE_NAME: "deadman-incident-commander"
+  DEADMAN_P99_BUDGET_MS: "1500"
+  DEADMAN_REVOKE_AT_DEPTH: "2"
+  DEADMAN_MIN_REPLICA_FLOOR: "2"
+
+# ---------------------------------------------------------------------------
+# Secret environment (Kubernetes Secret)
+# Placeholder values — replace with real secrets via --set or external-secrets.
+# ---------------------------------------------------------------------------
+secrets:
+  TFY_API_KEY: "REPLACE_ME"
+  TFY_GATEWAY_BASE_URL: "REPLACE_ME"
+  TFY_MCP_GATEWAY_URL: "REPLACE_ME"
+  DEADMAN_WEBHOOK_SECRET: "REPLACE_ME"
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"          # omit if using IRSA
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"      # omit if using IRSA
+  OTEL_EXPORTER_OTLP_ENDPOINT: ""          # leave empty to disable OTel
+
+# ---------------------------------------------------------------------------
+# Ingress (disabled by default — use your cluster's ingress controller)
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: deadman.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown
+# ---------------------------------------------------------------------------
+terminationGracePeriodSeconds: 60   # allow in-flight incidents to drain on SIGTERM
+
+# ---------------------------------------------------------------------------
+# Node selector / tolerations / affinity
+# ---------------------------------------------------------------------------
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# ---------------------------------------------------------------------------
+# Extra labels and annotations
+# ---------------------------------------------------------------------------
+podAnnotations: {}
+podLabels: {}

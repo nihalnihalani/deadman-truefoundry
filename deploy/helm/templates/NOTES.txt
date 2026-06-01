@@ -1,0 +1,41 @@
+DEADMAN has been deployed!
+
+1. Get the service URL:
+{{- if .Values.ingress.enabled }}
+  {{- range $host := .Values.ingress.hosts }}
+  {{- range .paths }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ $host.host }}{{ .path }}
+  {{- end }}
+  {{- end }}
+{{- else if contains "NodePort" .Values.service.type }}
+  export NODE_PORT=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ include "deadman.fullname" . }})
+  export NODE_IP=$(kubectl get nodes --namespace {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+  echo http://$NODE_IP:$NODE_PORT
+{{- else if contains "LoadBalancer" .Values.service.type }}
+  NOTE: It may take a few minutes for the LoadBalancer IP to be available.
+  You can watch the status of by running 'kubectl get --namespace {{ .Release.Namespace }} svc -w {{ include "deadman.fullname" . }}'
+  export SERVICE_IP=$(kubectl get svc --namespace {{ .Release.Namespace }} {{ include "deadman.fullname" . }} --template "{{"{{ range (index .status.loadBalancer.ingress 0) }}{{.}}{{ end }}"}}")
+  echo http://$SERVICE_IP:{{ .Values.service.port }}
+{{- else }}
+  export POD_NAME=$(kubectl get pods --namespace {{ .Release.Namespace }} -l "{{ include "deadman.selectorLabels" . }}" -o jsonpath="{.items[0].metadata.name}")
+  kubectl --namespace {{ .Release.Namespace }} port-forward $POD_NAME 8080:8080
+  echo "Visit http://127.0.0.1:8080 to access DEADMAN"
+{{- end }}
+
+2. Check readiness:
+  curl http://<URL>/readyz     # should return {"ok":true, "errors":[]}
+  curl http://<URL>/healthz    # should return {"status":"ok"}
+
+3. IMPORTANT: Replace placeholder secrets before going to production!
+   helm upgrade deadman ./deploy/helm \
+     --set secrets.TFY_API_KEY="<real-key>" \
+     --set secrets.TFY_GATEWAY_BASE_URL="<real-url>" \
+     --set secrets.TFY_MCP_GATEWAY_URL="<real-url>" \
+     --set secrets.DEADMAN_WEBHOOK_SECRET="<32-byte-hex>"
+
+4. For IRSA (recommended over static AWS keys), annotate the ServiceAccount:
+   --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="<role-arn>"
+   Then remove AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY from secrets.
+
+5. AWS infrastructure (DynamoDB + IAM) must be created before the first incident:
+   cd terraform && terraform init && terraform apply

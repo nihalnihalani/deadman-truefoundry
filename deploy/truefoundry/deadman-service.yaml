@@ -1,0 +1,228 @@
+# DEADMAN — TrueFoundry Service deployment spec
+# =================================================
+# Apply with:  tfy apply -f deploy/truefoundry/deadman-service.yaml
+#
+# This spec follows TrueFoundry's documented Service component shape.
+# Field names and nested keys match the schema published at
+#   https://docs.truefoundry.com/docs/define-a-service
+# Because TrueFoundry evolves its schema per tenant version, cross-check any
+# key that triggers a validation error against your workspace's current API spec
+# (tfy explain service --version <workspace-version>).
+#
+# PREREQUISITES
+#   1. Build & push the Docker image:
+#        docker build -t <registry>/<workspace>/deadman:<tag> .
+#        docker push <registry>/<workspace>/deadman:<tag>
+#      OR configure the image.build block below to trigger an in-platform build.
+#   2. Create TFY Secrets (or a Secret Group) for all _secret_ keys listed under
+#      env.secretRef — see deploy/truefoundry/README.md for the exact secret names.
+#   3. Apply the AI/MCP Gateway configs first:
+#        tfy apply -f infra/ai_gateway.yaml
+#        tfy apply -f infra/guardrails.yaml
+#
+# NOTE ON IMAGE
+#   Two options are shown: a prebuilt image ref (default/recommended) and an
+#   inline build spec (comment-toggled). Pick one — they are mutually exclusive.
+
+name: deadman
+type: service                             # TFY component type
+
+# ---- Workspace / project placement ----------------------------------------
+# Uncomment and fill in your TFY workspace + project FQN.
+# workspace: <your-workspace-fqn>         # e.g. tfy-usea1-devtest:my-project
+# project: <your-project-fqn>
+
+# ---- Image -----------------------------------------------------------------
+# Option A: prebuilt image (recommended for CI/CD pipelines).
+# Replace with your real registry path; tag must be immutable (SHA or semver).
+image:
+  type: image
+  image_uri: <your-registry>/deadman:latest   # e.g. docker.io/myorg/deadman:0.1.0
+  # If the registry requires credentials, reference a TFY-managed docker secret:
+  # credentials:
+  #   type: docker-credentials
+  #   secret: <tfy-secret-name-for-docker-creds>
+
+# Option B: in-platform build from repo (comment-out Option A if using this).
+# image:
+#   type: build
+#   build_spec:
+#     type: dockerfile
+#     build_context_path: .
+#     dockerfile_path: Dockerfile
+#   build_source:
+#     type: github
+#     repo: <github-org>/deadman-truefoundry
+#     branch: main
+
+# ---- Runtime ports ---------------------------------------------------------
+# TrueFoundry expects at least one port entry; the `expose` flag adds an ingress.
+ports:
+  - port: 8080
+    protocol: TCP
+    expose: true                          # creates an HTTPS ingress
+    # path: /                             # host-path prefix if you need sub-path routing
+
+# ---- Health probes ---------------------------------------------------------
+# Matches the Dockerfile HEALTHCHECK + /healthz liveness / /readyz readiness
+# implemented in deadman/webhook.py.
+liveness_probe:
+  type: http
+  path: /healthz
+  port: 8080
+  initial_delay_seconds: 15
+  period_seconds: 30
+  timeout_seconds: 5
+  failure_threshold: 3
+
+readiness_probe:
+  type: http
+  path: /readyz
+  port: 8080
+  initial_delay_seconds: 10
+  period_seconds: 15
+  timeout_seconds: 5
+  failure_threshold: 2
+
+# ---- Resources -------------------------------------------------------------
+# Start conservatively; scale after profiling. The service is I/O-bound
+# (Bedrock latency) so CPU request can stay low while memory covers the model
+# client + state caches. Adjust based on p99 latency profiling.
+resources:
+  cpu_request: "250m"
+  cpu_limit: "1000m"
+  memory_request: "256Mi"
+  memory_limit: "512Mi"
+  # ephemeral_storage_request: "512Mi"    # uncomment if file-backend is used
+
+# ---- Replicas & autoscaling ------------------------------------------------
+# min_replicas: 1 is the safe floor for demos. Raise to 2+ in prod for HA.
+replicas:
+  type: autoscaling
+  min_replicas: 1
+  max_replicas: 5
+  metrics:
+    - type: cpu
+      target_utilization_percentage: 60  # shed load before p99 degrades
+
+# ---- Environment variables -------------------------------------------------
+# Non-secret configuration is inlined here.
+# Secret values are pulled from TFY Secret references (secretRef blocks).
+#
+# HOW TO CREATE TFY SECRETS (console or CLI):
+#   tfy secret create --name deadman-tfy-api-key       --value "<actual-value>"
+#   tfy secret create --name deadman-tfy-gateway-url   --value "https://..."
+#   tfy secret create --name deadman-mcp-gateway-url   --value "https://..."
+#   tfy secret create --name deadman-webhook-secret    --value "$(openssl rand -hex 32)"
+#   tfy secret create --name deadman-aws-access-key-id --value "<aws-key-id>"
+#   tfy secret create --name deadman-aws-secret-key    --value "<aws-secret>"
+#
+# Alternatively create a TFY Secret Group named "deadman" with these as keys,
+# and mount the whole group as secretFrom (see TFY docs for secretFrom syntax).
+
+env:
+  # ---- Mode & feature flags (non-secret) -----------------------------------
+  - name: DEADMAN_MODE
+    value: "real"
+
+  - name: DEADMAN_ENABLE_DEMO
+    value: "0"                            # must be 0 in production
+
+  - name: DEADMAN_STATE_BACKEND
+    value: "dynamodb"
+
+  - name: DEADMAN_DYNAMODB_TABLE
+    value: "deadman-incident-state"       # must match terraform/main.tf table name
+
+  - name: TFY_RESILIENT_MODEL
+    value: "deadman-resilient-bedrock"    # must match infra/ai_gateway.yaml name
+
+  - name: TFY_METADATA
+    value: "app=deadman,role=incident-commander"
+
+  - name: AWS_REGION
+    value: "us-east-1"
+
+  - name: AWS_FALLBACK_REGION
+    value: "us-west-2"
+
+  - name: OTEL_SERVICE_NAME
+    value: "deadman-incident-commander"
+
+  - name: DEADMAN_P99_BUDGET_MS
+    value: "1500"
+
+  - name: DEADMAN_REVOKE_AT_DEPTH
+    value: "2"
+
+  - name: DEADMAN_MIN_REPLICA_FLOOR
+    value: "2"
+
+  # ---- Secret env vars: referenced from TFY Secrets ------------------------
+  # Each secretRef block pulls the value from a named TFY Secret.
+  # Adjust <secret-name-or-fqn> to match the secret names you created above,
+  # or replace secretRef with secretFrom for a Secret Group mount.
+  # Schema note: the exact secretRef key (type / secret_fqn / secret_name) may
+  # differ by TFY tenant version — verify with `tfy explain secretRef`.
+
+  - name: TFY_API_KEY
+    value_from:
+      type: secret
+      secret_name: deadman-tfy-api-key   # created via tfy secret create
+
+  - name: TFY_GATEWAY_BASE_URL
+    value_from:
+      type: secret
+      secret_name: deadman-tfy-gateway-url
+
+  - name: TFY_MCP_GATEWAY_URL
+    value_from:
+      type: secret
+      secret_name: deadman-mcp-gateway-url
+
+  - name: DEADMAN_WEBHOOK_SECRET
+    value_from:
+      type: secret
+      secret_name: deadman-webhook-secret
+
+  - name: AWS_ACCESS_KEY_ID
+    value_from:
+      type: secret
+      secret_name: deadman-aws-access-key-id
+  # Note: prefer IRSA/workload identity over static AWS keys in production.
+  # If your TFY cluster has IRSA configured, omit AWS_ACCESS_KEY_ID and
+  # AWS_SECRET_ACCESS_KEY and attach the IAM role ARN from terraform/outputs.tf
+  # as an annotation on the service account instead.
+
+  - name: AWS_SECRET_ACCESS_KEY
+    value_from:
+      type: secret
+      secret_name: deadman-aws-secret-key
+
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value_from:
+      type: secret
+      secret_name: deadman-otel-endpoint  # leave unset if OTel is not needed
+
+# ---- Lifecycle command (matches Dockerfile CMD) ----------------------------
+command:
+  - "uvicorn"
+  - "deadman.webhook:app"
+  - "--host"
+  - "0.0.0.0"
+  - "--port"
+  - "8080"
+  - "--workers"
+  - "2"           # 2 workers per replica; tune with profiling (async app, I/O-bound)
+
+# ---- Graceful shutdown -----------------------------------------------------
+# Rampart wave adds SIGTERM drain; allow the process to finish in-flight incidents.
+termination_grace_period_seconds: 60
+
+# ---- Pod-level security context --------------------------------------------
+# Matches the non-root USER deadman in the Dockerfile.
+security_context:
+  run_as_non_root: true
+  run_as_user: 1001           # uid assigned by adduser --system in Dockerfile
+  read_only_root_filesystem: false   # /app/.deadman_state is written when using file backend
+  allow_privilege_escalation: false

@@ -1,0 +1,184 @@
+# DEADMAN CI — ruff · mypy · pytest · pip-audit · bandit · docker+trivy
+# Triggers on every PR and on pushes to main.
+# Bandit skips low-confidence noise; Trivy uses exit-code 0 for unfixed vulns
+# (images often carry unfixed OS CVEs with no available fix — failing on those
+#  creates noise without actionable remediation; CRITICAL/HIGH with a fix still fail).
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Lint — ruff check + ruff format (no Python matrix needed, style is style)
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-lint-${{ hashFiles('requirements-dev.txt') }}
+          restore-keys: pip-lint-
+
+      - name: Install ruff
+        run: pip install --quiet ruff>=0.3.0
+
+      - name: ruff check
+        run: python -m ruff check .
+
+      # Format check is informational: the existing codebase has not been
+      # through a formatting pass yet.  The lead will run `ruff format .`
+      # in a cleanup commit; pre-commit enforces format on NEW code.
+      # Remove `|| true` once the codebase is formatted.
+      - name: ruff format (check only)
+        run: python -m ruff format --check . || true
+
+  # ---------------------------------------------------------------------------
+  # Type-check — mypy (lenient baseline; tighten gradually)
+  # ---------------------------------------------------------------------------
+  type:
+    name: Type-check (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-type-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
+          restore-keys: pip-type-
+
+      - name: Install deps
+        run: |
+          pip install --quiet -r requirements.txt -r requirements-dev.txt
+
+      - name: mypy
+        run: python -m mypy deadman
+
+  # ---------------------------------------------------------------------------
+  # Tests — matrix over Python 3.12 + 3.13
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-test-${{ matrix.python-version }}-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
+          restore-keys: pip-test-${{ matrix.python-version }}-
+
+      - name: Install deps
+        run: |
+          pip install --quiet -r requirements.txt -r requirements-dev.txt
+
+      - name: Run pytest with coverage
+        run: |
+          python -m pytest -q --cov=deadman --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-py${{ matrix.python-version }}
+          path: coverage.xml
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # Security — pip-audit (deps) + bandit (code)
+  # ---------------------------------------------------------------------------
+  security:
+    name: Security (pip-audit + bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-sec-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
+          restore-keys: pip-sec-
+
+      - name: Install security tools
+        run: |
+          pip install --quiet -r requirements.txt pip-audit bandit
+
+      - name: pip-audit (known CVEs in dependencies)
+        run: pip-audit -r requirements.txt
+
+      - name: bandit (static security analysis — HIGH severity/confidence only)
+        # -l HIGH severity, -i HIGH confidence, -q quiet, skip low-noise tests
+        # B101 (assert), B311 (random) are benign in this test-heavy codebase
+        run: |
+          python -m bandit -r deadman \
+            --severity-level high \
+            --confidence-level high \
+            --skip B101,B311 \
+            -q
+
+  # ---------------------------------------------------------------------------
+  # Docker — build image + Trivy vulnerability scan
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Docker build + Trivy scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t deadman:ci .
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: deadman:ci
+          format: table
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+          # exit-code 0 for unfixed: OS base images frequently carry CVEs with
+          # no upstream fix available. Failing on those creates noise with no
+          # actionable remediation. We still surface them in the table output.
+          # Set to 1 here to fail on any CRITICAL/HIGH (fixed or unfixed).
+          # Change to 0 if base-image churn causes flakes, and document why.
+          exit-code: "1"
+          ignore-unfixed: true
