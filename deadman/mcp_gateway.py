@@ -48,6 +48,10 @@ import deadman.config as config
 from deadman.guardrails import GuardrailBlock, ScopeDenied  # noqa: F401
 import deadman.guardrails as _guardrails
 
+# [PULSE] Observability helpers — lazy, no-op when prometheus_client absent
+import deadman.metrics as _metrics
+import deadman.otel as _otel
+
 
 class KillSignal(Exception):
     """Simulates a SIGKILL mid-action (process death between side effect and COMMIT)."""
@@ -104,6 +108,8 @@ class MCPGateway:
         if tool in config.DESTRUCTIVE_TOOLS and tool not in allowed_scope:
             self.audit.write({"status": "DENIED", "tool": tool, "key": key,
                               "reason": "scope/autonomy"})
+            # [PULSE] Record scope-denied metric (no-op when prometheus_client absent)
+            _metrics.record_scope_denied(tool)
             raise ScopeDenied(
                 f"{tool} denied — not in allowed scope {sorted(allowed_scope)}"
             )
@@ -113,6 +119,8 @@ class MCPGateway:
         # gateway Idempotency-Key in real mode; it's the primary guard in mock mode.
         if self.audit.is_committed(key):
             self.audit.write({"status": "SKIPPED_IDEMPOTENT", "tool": tool, "key": key})
+            # [PULSE] Record skipped-idempotent tool call metric
+            _metrics.observe_tool(tool, "SKIPPED_IDEMPOTENT", 0.0)
             return ToolResult("SKIPPED_IDEMPOTENT")
 
         # Pre-tool guardrail (raises GuardrailBlock if invalid).
@@ -120,10 +128,30 @@ class MCPGateway:
         self.audit.write({"status": "PENDING", "tool": tool, "key": key})
 
         # ── branch on mode ────────────────────────────────────────────────────
-        if config.is_real():
-            return self._execute_real(tool, args, key)
-        else:
-            return self._execute_mock(tool, args, key)
+        # [PULSE] Time the inner execution; record metric regardless of outcome
+        import time as _time
+        _t0 = _time.monotonic()
+        _result_label = "ERROR"
+        try:
+            with _otel.span("mcp.execute", tool=tool, key=key):
+                if config.is_real():
+                    _result = self._execute_real(tool, args, key)
+                else:
+                    _result = self._execute_mock(tool, args, key)
+            _result_label = _result.status
+            return _result
+        except GuardrailBlock:
+            _result_label = "GUARDRAIL_BLOCK"
+            _metrics.record_guardrail_block(tool)
+            raise
+        except ScopeDenied:
+            _result_label = "SCOPE_DENIED"
+            raise
+        except Exception:
+            raise
+        finally:
+            _latency = _time.monotonic() - _t0
+            _metrics.observe_tool(tool, _result_label, _latency)
 
     # ── real execution path ───────────────────────────────────────────────────
 

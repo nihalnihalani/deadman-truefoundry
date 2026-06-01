@@ -27,7 +27,7 @@ from typing import AsyncGenerator
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -40,6 +40,14 @@ from deadman.mcp_gateway import KillSignal
 from deadman.state import AuditLog, DurableState
 
 logger = logging.getLogger("deadman.webhook")
+
+# ---------------------------------------------------------------------------
+# [PULSE] Configure structured JSON logging (idempotent — safe to call here)
+# ---------------------------------------------------------------------------
+from deadman.logging_config import configure_logging, set_correlation_id  # noqa: E402
+import deadman.metrics as _metrics  # noqa: E402
+
+configure_logging()
 
 # ---------------------------------------------------------------------------
 # App + CORS
@@ -119,6 +127,50 @@ def _validate_http_incident_id(incident_id: str) -> str:
         return config.validate_incident_id(incident_id)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+# ---------------------------------------------------------------------------
+# [PULSE] Structured-logging + correlation-id middleware
+# ---------------------------------------------------------------------------
+
+@app.middleware("http")
+async def _observability_middleware(request: Request, call_next):
+    """Inject correlation id + emit structured request/response log lines.
+
+    The correlation id is extracted from the incident_id query/path param for
+    /incident requests; for all other requests we use a fresh UUID.
+    This middleware is purely observational — it does NOT alter any response.
+    """
+    # Best-effort: pull incident_id from path params (populated after routing,
+    # so we fall back to a generated id here and let the handler call
+    # set_correlation_id() with the real id when it has it).
+    cid = str(uuid.uuid4())
+    set_correlation_id(cid)
+
+    logger.info(
+        "request started",
+        extra={"method": request.method, "path": request.url.path},
+    )
+    start = os.times().elapsed if hasattr(os.times(), "elapsed") else 0.0
+    try:
+        import time as _time
+        _t0 = _time.monotonic()
+        response = await call_next(request)
+        _latency_ms = round((_time.monotonic() - _t0) * 1000, 1)
+        logger.info(
+            "request finished",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "latency_ms": _latency_ms,
+            },
+        )
+        return response
+    finally:
+        # Clear the correlation id once the request is done so it does not
+        # bleed into the next request on the same thread/task.
+        set_correlation_id(None)
+
 
 # ---------------------------------------------------------------------------
 # OTel init (no-op when OTEL not configured)
@@ -201,6 +253,22 @@ def healthz():
 def readyz():
     status = config.readiness()
     return JSONResponse(status_code=200 if status["ok"] else 503, content=status)
+
+
+# ---------------------------------------------------------------------------
+# [PULSE] /metrics — Prometheus exposition (always available internally)
+# ---------------------------------------------------------------------------
+
+@app.get("/metrics")
+def metrics_endpoint():
+    """Expose Prometheus metrics.
+
+    Returns 200 with Prometheus text-exposition format when prometheus_client is
+    installed, or a graceful plain-text placeholder when it is not.
+    Content-Type is set correctly in both cases so scrapers do not choke.
+    """
+    content, content_type = _metrics.render()
+    return Response(content=content, media_type=content_type)
 
 
 # ---------------------------------------------------------------------------

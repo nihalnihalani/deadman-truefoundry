@@ -30,6 +30,10 @@ from deadman.state import DurableState, AuditLog
 import deadman.tools as tools
 import deadman.planner as planner
 
+# [PULSE] Observability — lazy imports so mock mode / tests without the libs never crash
+import deadman.otel as _otel
+import deadman.metrics as _metrics
+
 
 @dataclass
 class Scoreboard:
@@ -147,9 +151,12 @@ class Deadman:
                     )
 
         # --- diagnose / decide (model calls go through the AI Gateway fallback chain) ---
+        # [PULSE] Wrap each LLM step in an OTel span (no-op when OTel unset)
         try:
-            self.ai.complete("diagnose the incident from cloudwatch + k8s events")
-            self.ai.complete("decide the mitigation: revert the bad deploy PR-1337")
+            with _otel.span("agent.step", step="diagnose", incident_id=self.incident_id):
+                self.ai.complete("diagnose the incident from cloudwatch + k8s events")
+            with _otel.span("agent.step", step="decide", incident_id=self.incident_id):
+                self.ai.complete("decide the mitigation: revert the bad deploy PR-1337")
         except ModelOutage:
             sb.notes.append("all tiers + cold cache down — degraded to safe hold")
 
@@ -209,6 +216,11 @@ class Deadman:
         sb.double_executions = max(self.world.count("revert_pr") - 1, 0)
         sb.survived = True
         sb.notes.append("incident resolved; postmortem written from the audit log")
+        # [PULSE] Record incident metrics (no-op when prometheus_client absent)
+        _metrics.record_incident(mode=config.MODE, outcome="resolved")
+        _metrics.record_fallback_depth(sb.fallback_depth)
+        if sb.double_executions > 0:
+            _metrics.record_double_execution()
         return sb
 
     # -------------------------------------------------------------------------
@@ -265,8 +277,12 @@ class Deadman:
         for _step in range(max_steps):
             # ── build prompt + call LLM ────────────────────────────────────────
             prompt = planner.build_prompt(summary, observations, catalog)
+            # [PULSE] Span per agentic loop step (no-op when OTel unset)
+            with _otel.span("agent.agentic_step", step=str(_step), incident_id=self.incident_id):
+                pass  # span wraps just the LLM call below
             try:
-                comp = self.ai.complete(prompt)
+                with _otel.span("agent.llm_call", step=str(_step), incident_id=self.incident_id):
+                    comp = self.ai.complete(prompt)
             except ModelOutage:
                 sb.notes.append("all tiers + cold cache down — degraded to safe hold")
                 observations.append("[model-outage] all AI tiers down — stopping loop")
@@ -360,4 +376,9 @@ class Deadman:
             "agentic loop finished; postmortem from audit log covers "
             f"{len(observations)} observations over up to {max_steps} steps"
         )
+        # [PULSE] Record incident metrics (no-op when prometheus_client absent)
+        _metrics.record_incident(mode=config.MODE, outcome="resolved")
+        _metrics.record_fallback_depth(sb.fallback_depth)
+        if sb.double_executions > 0:
+            _metrics.record_double_execution()
         return sb

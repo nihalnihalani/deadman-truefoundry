@@ -93,6 +93,32 @@ def init_otel(app=None) -> None:
 
 
 @contextlib.contextmanager
+def span(name: str, **attrs):
+    """Generic no-op-safe span context manager for agent/tool steps.
+
+    When OTel is not active (mock mode, packages absent, or OTEL_EXPORTER_OTLP_ENDPOINT
+    unset) this is a zero-overhead no-op context manager — it yields None and returns.
+    When OTel IS active it starts a child span named *name* with the supplied keyword
+    arguments as span attributes.
+
+    Example
+    -------
+    ::
+
+        with otel.span("agent.step", step="diagnose", incident_id=self.incident_id):
+            result = self.ai.complete(prompt)
+    """
+    if not _otel_active or _tracer is None:
+        yield
+        return
+
+    with _tracer.start_as_current_span(name) as _span:
+        for k, v in attrs.items():
+            _span.set_attribute(k, str(v))
+        yield _span
+
+
+@contextlib.contextmanager
 def audit_span(name: str, attributes: dict | None = None):
     """Context manager that wraps a block in an OTel span named *name*.
 
