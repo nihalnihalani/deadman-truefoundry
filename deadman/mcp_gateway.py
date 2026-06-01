@@ -161,6 +161,12 @@ class MCPGateway:
         No chaos injection in real mode — chaos is demo-only.
         The TFY gateway handles Cedar policy; we still hold the pre-tool
         guardrail above as a client-side guard.
+
+        After a confirmed successful (non-skipped) destructive tool call,
+        self.world.<verb> is called to record intent — matching the mock path.
+        RealWorld.<verb> only RECORDS intent (it does NOT call the gateway again),
+        so there is no double-execution risk.  This makes reconciliation path (a)
+        (in-memory intent log) live in real mode, matching the docstring claim.
         """
         from deadman import realmode_mcp  # lazy import — only needed in real mode
 
@@ -182,6 +188,20 @@ class MCPGateway:
         won = self.audit.claim_commit(key, tool)
         if not won:
             return ToolResult("SKIPPED_IDEMPOTENT")
+
+        # Record intent on the world adapter — RECORDS only, no re-execution.
+        # Guard with hasattr so a world without a given method (e.g. a stub in tests)
+        # will not crash.  This mirrors the mock path and makes RealWorld._applied live.
+        if tool == "github.revert_pr":
+            if hasattr(self.world, "revert_pr"):
+                self.world.revert_pr(args.get("pr", ""), key)
+        elif tool == "k8s.cordon_drain":
+            if hasattr(self.world, "cordon_drain"):
+                self.world.cordon_drain(args.get("node", ""), key)
+        elif tool == "asg.scale":
+            if hasattr(self.world, "asg_scale"):
+                self.world.asg_scale(args.get("asg", ""), args.get("replicas", 0), key)
+
         return ToolResult("EXECUTED", value)
 
     # ── mock execution path (UNCHANGED behaviour) ─────────────────────────────

@@ -29,6 +29,7 @@ from deadman.agent_gateway import AgentGateway
 from deadman.state import DurableState, AuditLog
 import deadman.tools as tools
 import deadman.planner as planner
+import deadman.guardrails as _guardrails
 
 # [PULSE] Observability — lazy imports so mock mode / tests without the libs never crash
 import deadman.otel as _otel
@@ -164,7 +165,11 @@ class Deadman:
         sb.fallback_depth = self.ai.max_depth
         scope = self._scope()
 
+        # Track tool attempts for the kill-switch block-rate computation.
+        _tool_attempts = 0
+
         # --- governed diagnostic read; Post-Tool guardrail catches a corrupt/garbage result ---
+        _tool_attempts += 1
         try:
             self.mcp.execute("cw.get_metrics", {"_returns": {"cpu": 0.9}}, self.diag_key, scope)
         except GuardrailBlock as e:
@@ -173,6 +178,7 @@ class Deadman:
         # --- the destructive action: revert PR-1337, idempotency-keyed, governed, audited ---
         if not self.audit.is_committed(self.revert_key):
             self.state.set_pending("github.revert_pr", self.revert_key)
+            _tool_attempts += 1
             try:
                 # If authority was revoked, restore it for the *reconciliation* of an in-flight
                 # action (we only skip NEW destructive actions; finishing a committed one is safe).
@@ -185,6 +191,16 @@ class Deadman:
                 raise
             except ScopeDenied as e:
                 sb.notes.append(str(e))
+
+        # --- Kill-switch: Phase A rate check (after first tool-execution phase) ---
+        # Primary control is the TFY gateway block-prompt-injection guardrail; this is
+        # defense-in-depth matching infra/guardrails.yaml kill_switch_block_rate_threshold: 0.5.
+        _block_rate_a = self.mcp.guardrail_blocks / max(1, _tool_attempts)
+        if self.agentgw.trip_kill_switch(_block_rate_a):
+            sb.notes.append(
+                f"kill-switch TRIPPED (phase-A block rate {_block_rate_a:.2f} >= 0.5) "
+                "— destructive scope revoked"
+            )
 
         # --- Phase B: the outage DEEPENS -> auto-leash ---
         # In chaos/demo mode: inject tier-1 failure and call the AI gateway for a re-plan.
@@ -207,10 +223,22 @@ class Deadman:
         # now holds for cordon_drain too, not just revert_pr.
         if "k8s.cordon_drain" in scope2 and not self.audit.is_committed(self.cordon_key):
             self.state.set_pending("k8s.cordon_drain", self.cordon_key)
+        _tool_attempts += 1
         try:
             self.mcp.execute("k8s.cordon_drain", {"node": "prod-node-7"}, self.cordon_key, scope2)
         except ScopeDenied as e:
             sb.notes.append("blocked a risky cordon_drain on a degraded brain -> " + str(e))
+
+        # --- Kill-switch: Phase B rate check (after all tool-execution phases) ---
+        # Recompute with the full attempt count; the latch means a previously-tripped
+        # switch stays revoked even if the rate dropped (harmless for subsequent scope calls).
+        _block_rate_b = self.mcp.guardrail_blocks / max(1, _tool_attempts)
+        if self.agentgw.trip_kill_switch(_block_rate_b):
+            if "kill-switch TRIPPED" not in " ".join(sb.notes):
+                sb.notes.append(
+                    f"kill-switch TRIPPED (phase-B block rate {_block_rate_b:.2f} >= 0.5) "
+                    "— destructive scope revoked"
+                )
 
         sb.guardrail_blocks = self.mcp.guardrail_blocks
         sb.double_executions = max(self.world.count("revert_pr") - 1, 0)
@@ -274,118 +302,148 @@ class Deadman:
         # ── REASON→ACT→OBSERVE LOOP ───────────────────────────────────────────
         catalog = tools.tool_catalog_prompt()
 
+        # Fix 4: sanitize the raw summary before it reaches the LLM prompt.
+        # The TFY gateway block-prompt-injection guardrail is the PRIMARY control;
+        # this local redact+cap is defense-in-depth only.
+        _safe_summary = _guardrails.redact_text(summary)[:2000]
+
+        # Track total tool attempts across all agentic steps for the kill-switch rate.
+        _total_tool_attempts = 0
+
         for _step in range(max_steps):
             # ── build prompt + call LLM ────────────────────────────────────────
-            prompt = planner.build_prompt(summary, observations, catalog)
-            # [PULSE] Span per agentic loop step (no-op when OTel unset)
+            # Use the sanitized summary in the prompt (defense-in-depth against prompt injection).
+            prompt = planner.build_prompt(_safe_summary, observations, catalog)
+            # [PULSE] Span per agentic loop step wraps the full step body (LLM call +
+            # action handling) — the empty pass block was replaced with the real work.
             with _otel.span("agent.agentic_step", step=str(_step), incident_id=self.incident_id):
-                pass  # span wraps just the LLM call below
-            try:
-                with _otel.span("agent.llm_call", step=str(_step), incident_id=self.incident_id):
+                try:
                     comp = self.ai.complete(prompt)
-            except ModelOutage:
-                sb.notes.append("all tiers + cold cache down — degraded to safe hold")
-                observations.append("[model-outage] all AI tiers down — stopping loop")
-                break
+                except ModelOutage:
+                    sb.notes.append("all tiers + cold cache down — degraded to safe hold")
+                    observations.append("[model-outage] all AI tiers down — stopping loop")
+                    break
 
-            # Track fallback depth / backend from the gateway response
-            sb.fallback_depth = self.ai.max_depth
-            sb.backend = "tier-%d" % self.ai.max_depth
+                # Track fallback depth / backend from the gateway response
+                sb.fallback_depth = self.ai.max_depth
+                sb.backend = "tier-%d" % self.ai.max_depth
 
-            # ── parse the model's decision ─────────────────────────────────────
-            action = planner.parse_action(comp.text)
+                # ── parse the model's decision ─────────────────────────────────────
+                action = planner.parse_action(comp.text)
 
-            # ── DONE ──────────────────────────────────────────────────────────
-            if action.done:
-                observations.append(f"[done] {action.rationale}")
-                sb.notes.append(f"model declared incident resolved: {action.rationale}")
-                break
+                # ── DONE ──────────────────────────────────────────────────────────
+                if action.done:
+                    observations.append(f"[done] {action.rationale}")
+                    sb.notes.append(f"model declared incident resolved: {action.rationale}")
+                    break
 
-            # ── SAFE-HOLD (unparseable / missing tool) ─────────────────────────
-            if action.tool is None:
-                note = f"[safe-hold] {action.rationale}"
-                observations.append(note)
-                sb.notes.append(note)
-                # counts toward budget but does NOT execute any tool
-                continue
+                # ── SAFE-HOLD (unparseable / missing tool) ─────────────────────────
+                if action.tool is None:
+                    note = f"[safe-hold] {action.rationale}"
+                    observations.append(note)
+                    sb.notes.append(note)
+                    # counts toward budget but does NOT execute any tool
+                    continue
 
-            # ── LOOK UP TOOL IN REGISTRY ───────────────────────────────────────
-            reg_tool = tools.REGISTRY.get(action.tool)
-            if reg_tool is None:
-                note = f"[unknown-tool] '{action.tool}' not in registry — safe-hold"
-                observations.append(note)
-                sb.notes.append(note)
-                continue
-
-            # ── VALIDATE MODEL-SUPPLIED ARGS ───────────────────────────────────
-            # LLMs routinely omit required args. Treat a validation failure exactly
-            # like a guardrail block: record it, do NOT execute, do NOT crash, and
-            # let the model choose again on the next turn.
-            try:
-                tools.validate_args(reg_tool, action.args)
-            except ValueError as e:
-                note = (
-                    f"[invalid-args] {action.tool}: {e} — choose again or pick another tool"
-                )
-                observations.append(note)
-                sb.notes.append(note)
-                continue
-
-            # ── IDEMPOTENCY KEY ───────────────────────────────────────────────
-            target = tools.idempotency_target(reg_tool, action.args)
-            if reg_tool.destructive:
-                # Destructive tools are exactly-once: key on the chosen action only,
-                # checkpoint BEFORE execute, dedup against the audit log.
-                key = action_key(self.incident_id, action.tool, target)
-                # Fast-path: already committed → tell the model, move on
-                if self.audit.is_committed(key):
-                    note = f"[skipped-idempotent] {action.tool}({target}) already committed"
+                # ── LOOK UP TOOL IN REGISTRY ───────────────────────────────────────
+                reg_tool = tools.REGISTRY.get(action.tool)
+                if reg_tool is None:
+                    note = f"[unknown-tool] '{action.tool}' not in registry — safe-hold"
                     observations.append(note)
                     sb.notes.append(note)
                     continue
-            else:
-                # Non-destructive tools (diagnostics, statuspage) must NOT be
-                # idempotency-deduped — the model must be able to re-fetch fresh
-                # metrics/logs on every step. Make each call distinct via the loop
-                # step index so it always executes (never SKIPPED_IDEMPOTENT).
-                key = action_key(self.incident_id, action.tool, f"{target}#step{_step}")
 
-            # ── PRE-EXECUTE: checkpoint destructive actions ────────────────────
-            scope = self._scope()
-            if reg_tool.destructive:
-                self.state.set_pending(action.tool, key)
+                # ── VALIDATE MODEL-SUPPLIED ARGS ───────────────────────────────────
+                # LLMs routinely omit required args. Treat a validation failure exactly
+                # like a guardrail block: record it, do NOT execute, do NOT crash, and
+                # let the model choose again on the next turn.
+                try:
+                    tools.validate_args(reg_tool, action.args)
+                except ValueError as e:
+                    note = (
+                        f"[invalid-args] {action.tool}: {e} — choose again or pick another tool"
+                    )
+                    observations.append(note)
+                    sb.notes.append(note)
+                    continue
 
-            # ── EXECUTE via MCP Gateway ────────────────────────────────────────
-            try:
-                result = self.mcp.execute(action.tool, action.args, key, scope)
-            except KillSignal:
-                # Kill semantics are unchanged: re-raise so tests / scripts catch it.
-                sb.notes.append(f"KILLED mid-{action.tool} (between side effect and COMMIT)")
-                raise
-            except ScopeDenied as e:
-                note = f"[scope-denied] {action.tool} blocked — {e}"
+                # ── IDEMPOTENCY KEY ───────────────────────────────────────────────
+                target = tools.idempotency_target(reg_tool, action.args)
+                if reg_tool.destructive:
+                    # Destructive tools are exactly-once: key on the chosen action only,
+                    # checkpoint BEFORE execute, dedup against the audit log.
+                    key = action_key(self.incident_id, action.tool, target)
+                    # Fast-path: already committed → tell the model, move on
+                    if self.audit.is_committed(key):
+                        note = f"[skipped-idempotent] {action.tool}({target}) already committed"
+                        observations.append(note)
+                        sb.notes.append(note)
+                        continue
+                else:
+                    # Non-destructive tools (diagnostics, statuspage) must NOT be
+                    # idempotency-deduped — the model must be able to re-fetch fresh
+                    # metrics/logs on every step. Make each call distinct via the loop
+                    # step index so it always executes (never SKIPPED_IDEMPOTENT).
+                    key = action_key(self.incident_id, action.tool, f"{target}#step{_step}")
+
+                # ── PRE-EXECUTE: checkpoint destructive actions ────────────────────
+                # Recompute scope here so a kill-switch trip from a prior step immediately
+                # narrows authority for the next destructive attempt.
+                scope = self._scope()
+                if reg_tool.destructive:
+                    self.state.set_pending(action.tool, key)
+
+                # ── EXECUTE via MCP Gateway ────────────────────────────────────────
+                _total_tool_attempts += 1
+                try:
+                    result = self.mcp.execute(action.tool, action.args, key, scope)
+                except KillSignal:
+                    # Kill semantics are unchanged: re-raise so tests / scripts catch it.
+                    sb.notes.append(f"KILLED mid-{action.tool} (between side effect and COMMIT)")
+                    raise
+                except ScopeDenied as e:
+                    note = f"[scope-denied] {action.tool} blocked — {e}"
+                    observations.append(note)
+                    sb.notes.append(note)
+                    sb.guardrail_blocks = self.mcp.guardrail_blocks
+                    continue
+                except GuardrailBlock as e:
+                    note = f"[guardrail-block] {action.tool} blocked — {e}"
+                    observations.append(note)
+                    sb.notes.append(note)
+                    sb.guardrail_blocks = self.mcp.guardrail_blocks
+                    # Kill-switch: check rate after every guardrail block so the next
+                    # iteration's _scope() call immediately honors the trip.
+                    _block_rate = self.mcp.guardrail_blocks / max(1, _total_tool_attempts)
+                    if self.agentgw.trip_kill_switch(_block_rate):
+                        sb.notes.append(
+                            f"kill-switch TRIPPED (block rate {_block_rate:.2f} >= 0.5) "
+                            "— destructive scope revoked for remaining steps"
+                        )
+                    continue
+
+                # ── POST-EXECUTE: commit + build observation ───────────────────────
+                if reg_tool.destructive and result.status == "EXECUTED":
+                    self.state.commit(action.tool, key)
+
+                obs_status = result.status  # "EXECUTED" | "SKIPPED_IDEMPOTENT"
+                note = (
+                    f"[{obs_status.lower()}] {action.tool}({target}) "
+                    f"rationale={action.rationale!r}"
+                )
                 observations.append(note)
                 sb.notes.append(note)
-                sb.guardrail_blocks = self.mcp.guardrail_blocks
-                continue
-            except GuardrailBlock as e:
-                note = f"[guardrail-block] {action.tool} blocked — {e}"
-                observations.append(note)
-                sb.notes.append(note)
-                sb.guardrail_blocks = self.mcp.guardrail_blocks
-                continue
 
-            # ── POST-EXECUTE: commit + build observation ───────────────────────
-            if reg_tool.destructive and result.status == "EXECUTED":
-                self.state.commit(action.tool, key)
-
-            obs_status = result.status  # "EXECUTED" | "SKIPPED_IDEMPOTENT"
-            note = (
-                f"[{obs_status.lower()}] {action.tool}({target}) "
-                f"rationale={action.rationale!r}"
-            )
-            observations.append(note)
-            sb.notes.append(note)
+        # ── KILL-SWITCH: final rate check across all steps ─────────────────────
+        # Catches the case where the rate crossed the threshold late in the loop but
+        # no individual guardrail block triggered the per-step check above.
+        _final_rate = self.mcp.guardrail_blocks / max(1, _total_tool_attempts)
+        if self.agentgw.trip_kill_switch(_final_rate):
+            if not any("kill-switch TRIPPED" in n for n in sb.notes):
+                sb.notes.append(
+                    f"kill-switch TRIPPED (final block rate {_final_rate:.2f} >= 0.5) "
+                    "— destructive scope revoked"
+                )
 
         # ── FINAL SCOREBOARD FIELDS ────────────────────────────────────────────
         sb.guardrail_blocks = self.mcp.guardrail_blocks

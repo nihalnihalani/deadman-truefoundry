@@ -43,7 +43,7 @@ FALLBACK_CHAIN: list[TierConfig] = [
     {"tier": 0, "family": "claude-opus-4-8", "model": "anthropic.claude-opus-4-8", "region": "us-east-1", "provider": "anthropic"},
     {"tier": 1, "family": "claude-opus-4-8", "model": "anthropic.claude-opus-4-8", "region": "us-west-2", "provider": "anthropic"},
     {"tier": 2, "family": "llama4-maverick", "model": "meta.llama4-maverick-17b-instruct-v1:0", "region": "us-west-2", "provider": "meta"},
-    {"tier": 3, "family": "mistral-large", "model": "mistral.mistral-large-2407-v1:0", "region": "us-west-2", "provider": "mistral"},
+    {"tier": 3, "family": "mistral-large-3", "model": "mistral.mistral-large-3-2506-v1:0", "region": "us-west-2", "provider": "mistral"},
     {"tier": 4, "family": "command-r-plus", "model": "cohere.command-r-plus-v1:0", "region": "us-west-2", "provider": "cohere"},
 ]
 SEMANTIC_CACHE_TIER = 5  # last resort: the "runbook brain"
@@ -201,6 +201,13 @@ def production_issues() -> list[dict[str, Any]]:
                 "severity": "warning",
                 "field": "DEADMAN_STATE_BACKEND",
                 "message": "file backend is single-host only; use dynamodb for multi-replica production",
+            })
+
+        if float(os.getenv("DEADMAN_RATE_LIMIT_RPS", "0")) <= 0:
+            issues.append({
+                "severity": "warning",
+                "field": "DEADMAN_RATE_LIMIT_RPS",
+                "message": "rate limiting is disabled in production; set DEADMAN_RATE_LIMIT_RPS=10 to enable",
             })
 
     return issues
