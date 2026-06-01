@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="DEADMAN — the incident-commander agent that survives its own outage. TrueFoundry Resilient Agents Hackathon, June 2026." />
+  <title>💀 DEADMAN — Resilient Incident Commander</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💀</text></svg>" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!--
+    DEADMAN — War-Room Frontend
+    Served statically by FastAPI from / (the same origin as the API).
+
+    If the backend is not running, the page renders a clear "BACKEND OFFLINE"
+    banner and remains fully usable for visual preview — no errors thrown.
+
+    Script builds all DOM at runtime (no external deps, no build step).
+  -->
+  <div id="app">
+    <!-- Inline fallback rendered before JS fires, replaced by app.js -->
+    <div style="
+      display:flex;flex-direction:column;align-items:center;justify-content:center;
+      height:100vh;gap:16px;font-family:'Courier New',monospace;color:#7a8a9a;
+    ">
+      <div style="font-size:48px">💀</div>
+      <div style="font-size:18px;color:#e8f0fe;letter-spacing:0.1em">DEADMAN</div>
+      <div style="font-size:12px;letter-spacing:0.15em">INITIALISING…</div>
+    </div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
