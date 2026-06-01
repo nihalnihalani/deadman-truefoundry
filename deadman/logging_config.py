@@ -136,8 +136,8 @@ def configure_logging(level: int = logging.INFO) -> None:
     formatter = _JSONFormatter()
     cid_filter = _CorrelationIdFilter()
 
-    for handler in root.handlers:
-        handler.setFormatter(formatter)
-        handler.addFilter(cid_filter)
+    for h in root.handlers:
+        h.setFormatter(formatter)
+        h.addFilter(cid_filter)
 
     _CONFIGURED = True

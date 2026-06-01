@@ -27,11 +27,9 @@ from typing import Generator
 # ── Try to import prometheus_client; fall back to no-op stubs ─────────────────
 
 try:
-    import prometheus_client as _prom
     from prometheus_client import Counter, Histogram, CONTENT_TYPE_LATEST, generate_latest
     _PROM_AVAILABLE = True
 except ImportError:  # pragma: no cover — tested via monkeypatch in test suite
-    _prom = None
     _PROM_AVAILABLE = False
 
 
