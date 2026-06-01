@@ -85,6 +85,54 @@ def test_live_query_failure_falls_back_to_audit(monkeypatch):
     assert rw.is_reverted("PR-1337") is False
 
 
+def test_webhook_wires_realworld_and_resumes_in_real_mode(monkeypatch, tmp_path):
+    """NEW-1 (Raven final pass): the /incident entrypoint must construct RealWorld in real
+    mode (so live reconciliation actually runs in the server) and resume when durable state
+    holds a pending action (so a re-delivered alert can't double-execute the in-flight action).
+    """
+    monkeypatch.setattr(config, "STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "MODE", "real")
+
+    import deadman.webhook as wh
+    from deadman.world import RealWorld, World
+    from deadman.state import DurableState
+
+    captured = {}
+
+    class _FakeDeadman:
+        def __init__(self, incident_id, world, chaos=None):
+            captured["world"] = world
+            captured["incident_id"] = incident_id
+
+        def run(self, resume=False):
+            captured["resume"] = resume
+
+            class _SB:  # minimal scoreboard stand-in
+                survived = True; backend = "tier-0"; fallback_depth = 0
+                double_executions = 0; guardrail_blocks = 0
+                drain_authority = "ON"; notes: list = []
+            return _SB()
+
+    monkeypatch.setattr(wh, "Deadman", _FakeDeadman)
+
+    # 1) Real mode, no prior state -> RealWorld, fresh run (resume=False).
+    wh._run_incident("inc-real-fresh")
+    assert isinstance(captured["world"], RealWorld), "real mode must use RealWorld, not mock World"
+    assert captured["resume"] is False
+
+    # 2) Real mode WITH a pending durable action -> resume=True (process-death recovery).
+    ds = DurableState("inc-real-pending")
+    ds.set_pending("github.revert_pr", "inc-real-pending::revert_pr::PR-1")
+    wh._run_incident("inc-real-pending")
+    assert isinstance(captured["world"], RealWorld)
+    assert captured["resume"] is True, "a pending uncommitted action must trigger resume, not a fresh run"
+
+    # 3) Mock mode still uses the in-memory World.
+    monkeypatch.setattr(config, "MODE", "mock")
+    wh._run_incident("inc-mock-fresh")
+    assert type(captured["world"]) is World
+
+
 def test_claim_commit_is_atomic_and_idempotent(monkeypatch, tmp_path):
     """P0-3: claim_commit wins exactly once for a key; replays return False (no double-commit)."""
     monkeypatch.setattr(config, "MODE", "mock")

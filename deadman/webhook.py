@@ -33,11 +33,11 @@ from pydantic import BaseModel
 
 import deadman.config as config
 from deadman import state as _state_module
-from deadman.world import World
+from deadman.world import World, RealWorld
 from deadman.chaos import Chaos
 from deadman.commander import NaiveAgent, Deadman, REVERT_KEY
 from deadman.mcp_gateway import KillSignal
-from deadman.state import AuditLog
+from deadman.state import AuditLog, DurableState
 
 logger = logging.getLogger("deadman.webhook")
 
@@ -166,8 +166,24 @@ def _scoreboard_dict(sb, incident_id: str | None = None, summary: str | None = N
 
 
 def _run_incident(incident_id: str) -> "Scoreboard":  # type: ignore[name-defined]
-    """Blocking agent run, offloaded to a worker thread by the handler."""
-    return Deadman(incident_id, World(), chaos=None).run()
+    """Blocking agent run, offloaded to a worker thread by the handler.
+
+    Real mode wires the production `RealWorld` system-of-record adapter (sharing the
+    incident's durable AuditLog), so the resume path reconciles against the LIVE provider
+    instead of an in-memory mock — this is what makes "exactly-once across process death"
+    true in the running server, not just in tests. Mock mode keeps the in-memory `World`.
+
+    The handler is resume-aware: if durable state already holds a pending (uncommitted)
+    action for this incident — i.e. a previous process crashed mid-mitigation — we resume
+    (rehydrate + dedupe) rather than start a fresh run, so a re-delivered alert can never
+    double-execute the in-flight destructive action.
+    """
+    if config.is_real():
+        world = RealWorld(audit_log=AuditLog(incident_id))
+    else:
+        world = World()
+    resume = DurableState(incident_id).pending is not None
+    return Deadman(incident_id, world, chaos=None).run(resume=resume)
 
 
 # ---------------------------------------------------------------------------
