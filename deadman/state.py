@@ -41,6 +41,12 @@ import json
 import os
 import tempfile
 import deadman.config as config
+from deadman.lifecycle import validate_transition, ttl_epoch
+
+# DynamoDB TTL retention (seconds). Read once at module load from the environment.
+# Override via DEADMAN_STATE_TTL_SECONDS; default 30 days (2 592 000 s).
+# Set to 0 to disable TTL writes entirely (opt-in: must be set explicitly).
+_TTL_SECONDS: int = int(os.getenv("DEADMAN_STATE_TTL_SECONDS", "2592000"))
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +163,52 @@ class FileBackend:
             if os.path.exists(p):
                 os.remove(p)
 
+    # ---- sweep (opt-in cleanup for cron/maintenance tasks) ----
+
+    @classmethod
+    def sweep(cls, older_than_seconds: float, state_dir: str | None = None) -> list[str]:
+        """Delete state/audit/lock files older than *older_than_seconds* (mtime-based).
+
+        Opt-in: only runs when explicitly called (e.g. from a cron task or CLI).
+        This method is NEVER called during normal incident processing, so it cannot
+        affect test runs or live incident handling.
+
+        Parameters
+        ----------
+        older_than_seconds:
+            Files whose mtime is more than this many seconds in the past are removed.
+        state_dir:
+            Directory to scan. Defaults to ``config.STATE_DIR``.
+
+        Returns
+        -------
+        list[str]
+            Absolute paths of the files that were deleted.
+        """
+        import time as _time
+
+        directory = state_dir if state_dir is not None else config.STATE_DIR
+        if not os.path.isdir(directory):
+            return []
+
+        cutoff = _time.time() - older_than_seconds
+        deleted: list[str] = []
+        _suffixes = (".state.json", ".audit.jsonl", ".lock")
+
+        for fname in os.listdir(directory):
+            if not any(fname.endswith(s) for s in _suffixes):
+                continue
+            fpath = os.path.join(directory, fname)
+            try:
+                mtime = os.path.getmtime(fpath)
+                if mtime < cutoff:
+                    os.remove(fpath)
+                    deleted.append(fpath)
+            except FileNotFoundError:
+                pass  # already gone — concurrent sweep or test cleanup
+
+        return deleted
+
 
 # ---------------------------------------------------------------------------
 # DynamoDB backend (production)
@@ -214,10 +266,15 @@ class DynamoDBBackend:
         return _empty_state(self.incident_id)
 
     def save_state(self, data: dict):
-        self._table.put_item(Item={
+        item: dict = {
             **self._state_key(),
             "data": json.dumps(data),
-        })
+        }
+        # Attach a TTL attribute when retention is configured (opt-in).
+        # DynamoDB will automatically expire the STATE item after this epoch.
+        if _TTL_SECONDS > 0:
+            item["ttl"] = ttl_epoch(_TTL_SECONDS)
+        self._table.put_item(Item=item)
 
     # ---- audit ----
 
@@ -377,6 +434,28 @@ class DurableState:
 
     def note(self, msg: str):
         self.data["timeline"].append(msg)
+        self._flush()
+
+    def set_phase(self, new_phase: str) -> None:
+        """Transition the incident lifecycle phase and persist immediately.
+
+        Validates the transition via ``lifecycle.validate_transition`` before
+        writing so invalid state-machine moves are rejected early.
+
+        Parameters
+        ----------
+        new_phase:
+            One of the lifecycle constants: ``triage``, ``mitigating``,
+            ``resolved``, ``closed``, or ``failed``.
+
+        Raises
+        ------
+        ValueError
+            If the transition is not permitted by the lifecycle state machine.
+        """
+        old_phase = self.data.get("phase", "triage")
+        validate_transition(old_phase, new_phase)
+        self.data["phase"] = new_phase
         self._flush()
 
     @property

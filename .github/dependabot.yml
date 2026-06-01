@@ -1,0 +1,39 @@
+# Dependabot — weekly automated dependency updates
+# Covers pip packages and GitHub Actions.
+
+version: 2
+
+updates:
+  # Python pip dependencies
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - python
+    commit-message:
+      prefix: "chore(deps)"
+    ignore:
+      # opentelemetry is intentionally commented out in requirements.txt;
+      # ignore updates until it's officially enabled.
+      - dependency-name: "opentelemetry-*"
+
+  # GitHub Actions
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: UTC
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: "chore(deps)"

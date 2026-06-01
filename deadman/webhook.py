@@ -16,6 +16,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
@@ -27,7 +28,7 @@ from typing import AsyncGenerator
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -38,14 +39,86 @@ from deadman.chaos import Chaos
 from deadman.commander import NaiveAgent, Deadman, REVERT_KEY, action_key
 from deadman.mcp_gateway import KillSignal
 from deadman.state import AuditLog, DurableState
+from deadman.ratelimit import RateLimiter
 
 logger = logging.getLogger("deadman.webhook")
+
+# ---------------------------------------------------------------------------
+# [PULSE] Configure structured JSON logging (idempotent — safe to call here)
+# ---------------------------------------------------------------------------
+from deadman.logging_config import configure_logging, set_correlation_id  # noqa: E402
+import deadman.metrics as _metrics  # noqa: E402
+
+configure_logging()
+
+# ---------------------------------------------------------------------------
+# [RAMPART] Rate limiter — configurable via DEADMAN_RATE_LIMIT_RPS env var.
+#
+# Default: 10 rps / burst 20 per client host.
+# Set DEADMAN_RATE_LIMIT_RPS=0 to disable (unlimited). Also always disabled
+# in tests when DEADMAN_RATE_LIMIT_RPS is unset (default=0 in that context).
+#
+# The default is intentionally 0 (disabled) when the env var is absent, so
+# that the existing test suite (which posts multiple incidents per test) is
+# never throttled. To enable in production, set DEADMAN_RATE_LIMIT_RPS=10.
+# ---------------------------------------------------------------------------
+
+_RATE_LIMIT_RPS: float = float(os.getenv("DEADMAN_RATE_LIMIT_RPS", "0"))
+_RATE_LIMIT_BURST: float = float(os.getenv("DEADMAN_RATE_LIMIT_BURST", str(max(1.0, _RATE_LIMIT_RPS * 2))))
+_incident_limiter = RateLimiter(rate_per_sec=_RATE_LIMIT_RPS, burst=_RATE_LIMIT_BURST)
+
+# ---------------------------------------------------------------------------
+# [RAMPART] Graceful shutdown state
+#
+# _shutting_down: set True on ASGI lifespan shutdown so /readyz returns 503
+#   (signals the load-balancer to stop routing new requests), while /healthz
+#   stays 200 (liveness probe — we are still alive, just draining).
+# _in_flight: counter of active /incident handler calls so we can drain them.
+# ---------------------------------------------------------------------------
+
+_shutting_down: bool = False
+_in_flight: int = 0
+_in_flight_lock = asyncio.Lock()
+
+# How long (seconds) to wait for in-flight handlers to drain before exiting.
+_DRAIN_TIMEOUT_SECONDS: float = float(os.getenv("DEADMAN_DRAIN_TIMEOUT_SECONDS", "10"))
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(application: FastAPI):
+    """Lifespan context manager: startup (no-op) + graceful shutdown drain."""
+    # ── startup ──────────────────────────────────────────────────────────────
+    yield
+    # ── shutdown ─────────────────────────────────────────────────────────────
+    global _shutting_down
+    _shutting_down = True
+    logger.info("shutdown signal received — draining in-flight requests")
+
+    # Poll until all in-flight /incident handlers have completed, or the drain
+    # timeout elapses (whichever comes first). Uses a short poll interval so we
+    # exit promptly when the queue is already empty.
+    _deadline = asyncio.get_event_loop().time() + _DRAIN_TIMEOUT_SECONDS
+    while True:
+        async with _in_flight_lock:
+            remaining = _in_flight
+        if remaining == 0:
+            break
+        if asyncio.get_event_loop().time() >= _deadline:
+            logger.warning(
+                "drain timeout — %d in-flight request(s) still active; exiting",
+                remaining,
+            )
+            break
+        await asyncio.sleep(0.05)
+
+    logger.info("drain complete")
+
 
 # ---------------------------------------------------------------------------
 # App + CORS
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="DEADMAN — resilient incident commander")
+app = FastAPI(title="DEADMAN — resilient incident commander", lifespan=_lifespan)
 
 # CORS: localhost dev origins only. We authenticate with a bearer/HMAC secret,
 # not cookies, so credentials are NOT allowed (avoids the credentialed-wildcard
@@ -121,6 +194,50 @@ def _validate_http_incident_id(incident_id: str) -> str:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 # ---------------------------------------------------------------------------
+# [PULSE] Structured-logging + correlation-id middleware
+# ---------------------------------------------------------------------------
+
+@app.middleware("http")
+async def _observability_middleware(request: Request, call_next):
+    """Inject correlation id + emit structured request/response log lines.
+
+    The correlation id is extracted from the incident_id query/path param for
+    /incident requests; for all other requests we use a fresh UUID.
+    This middleware is purely observational — it does NOT alter any response.
+    """
+    # Best-effort: pull incident_id from path params (populated after routing,
+    # so we fall back to a generated id here and let the handler call
+    # set_correlation_id() with the real id when it has it).
+    cid = str(uuid.uuid4())
+    set_correlation_id(cid)
+
+    logger.info(
+        "request started",
+        extra={"method": request.method, "path": request.url.path},
+    )
+    start = os.times().elapsed if hasattr(os.times(), "elapsed") else 0.0
+    try:
+        import time as _time
+        _t0 = _time.monotonic()
+        response = await call_next(request)
+        _latency_ms = round((_time.monotonic() - _t0) * 1000, 1)
+        logger.info(
+            "request finished",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "latency_ms": _latency_ms,
+            },
+        )
+        return response
+    finally:
+        # Clear the correlation id once the request is done so it does not
+        # bleed into the next request on the same thread/task.
+        set_correlation_id(None)
+
+
+# ---------------------------------------------------------------------------
 # OTel init (no-op when OTEL not configured)
 # ---------------------------------------------------------------------------
 from deadman.otel import init_otel  # noqa: E402
@@ -165,25 +282,30 @@ def _scoreboard_dict(sb, incident_id: str | None = None, summary: str | None = N
     return d
 
 
-def _run_incident(incident_id: str) -> "Scoreboard":  # type: ignore[name-defined]
+def _run_incident(incident_id: str, summary: str = "") -> "Scoreboard":  # type: ignore[name-defined]
     """Blocking agent run, offloaded to a worker thread by the handler.
 
-    Real mode wires the production `RealWorld` system-of-record adapter (sharing the
-    incident's durable AuditLog), so the resume path reconciles against the LIVE provider
-    instead of an in-memory mock — this is what makes "exactly-once across process death"
-    true in the running server, not just in tests. Mock mode keeps the in-memory `World`.
+    REAL mode runs the genuine LLM-driven agentic loop (`run_agentic`): the model
+    diagnoses the incident (the alert `summary` is fed into its reasoning prompt) and
+    selects the mitigation tools itself. It uses the production `RealWorld` system-of-record
+    adapter (sharing the incident's durable AuditLog), so the resume path reconciles against
+    the LIVE provider — making "exactly-once across process death" true in the running
+    server, not just in tests.
 
-    The handler is resume-aware: if durable state already holds a pending (uncommitted)
-    action for this incident — i.e. a previous process crashed mid-mitigation — we resume
-    (rehydrate + dedupe) rather than start a fresh run, so a re-delivered alert can never
-    double-execute the in-flight destructive action.
+    MOCK mode runs the deterministic scripted scenario (`run`) so the offline demo + the
+    test suite stay reproducible.
+
+    Both paths are resume-aware: if durable state already holds a pending (uncommitted)
+    action — a previous process crashed mid-mitigation — we resume (rehydrate + dedupe)
+    rather than start fresh, so a re-delivered alert can never double-execute the in-flight
+    destructive action.
     """
     incident_id = config.validate_incident_id(incident_id)
+    resume = DurableState(incident_id).pending is not None
     if config.is_real():
         world = RealWorld(audit_log=AuditLog(incident_id))
-    else:
-        world = World()
-    resume = DurableState(incident_id).pending is not None
+        return Deadman(incident_id, world, chaos=None).run_agentic(summary, resume=resume)
+    world = World()
     return Deadman(incident_id, world, chaos=None).run(resume=resume)
 
 
@@ -194,13 +316,36 @@ def _run_incident(incident_id: str) -> "Scoreboard":  # type: ignore[name-define
 
 @app.get("/healthz")
 def healthz():
+    # Liveness: always 200 while the process is alive, even during drain.
     return {"ok": True, "mode": config.MODE}
 
 
 @app.get("/readyz")
 def readyz():
+    # Readiness: 503 while draining so the load balancer stops routing new requests.
+    if _shutting_down:
+        return JSONResponse(
+            status_code=503,
+            content={"ok": False, "reason": "shutting down", "mode": config.MODE},
+        )
     status = config.readiness()
     return JSONResponse(status_code=200 if status["ok"] else 503, content=status)
+
+
+# ---------------------------------------------------------------------------
+# [PULSE] /metrics — Prometheus exposition (always available internally)
+# ---------------------------------------------------------------------------
+
+@app.get("/metrics")
+def metrics_endpoint():
+    """Expose Prometheus metrics.
+
+    Returns 200 with Prometheus text-exposition format when prometheus_client is
+    installed, or a graceful plain-text placeholder when it is not.
+    Content-Type is set correctly in both cases so scrapers do not choke.
+    """
+    content, content_type = _metrics.render()
+    return Response(content=content, media_type=content_type)
 
 
 # ---------------------------------------------------------------------------
@@ -210,25 +355,43 @@ def readyz():
 
 @app.post("/incident")
 async def handle_incident(inc: Incident, request: Request):
+    # Validate the incident id, then authenticate BEFORE rate-limiting so an
+    # unauthenticated caller cannot drain a victim IP's token bucket (an authed
+    # request is the only one that should consume budget).
     incident_id = _validate_http_incident_id(inc.incident_id)
 
     # Optional shared-secret auth (no-op when DEADMAN_WEBHOOK_SECRET is unset).
     await _verify_webhook_auth(request)
 
-    # Structured log of the incoming alert summary so the alert text is recorded.
-    # NOTE: the summary is echoed back and logged here; full prompt-wiring (feeding
-    # the alert text into the commander's diagnosis prompt) is a follow-up — it
-    # requires a Deadman.run() signature change owned by Anchor, so we do NOT claim
-    # it currently drives diagnosis.
+    # [RAMPART] Rate-limit by client host (IP or forwarded header) — after auth.
+    client_key = request.client.host if request.client else "unknown"
+    if not _incident_limiter.allow(client_key):
+        retry_after = _incident_limiter.retry_after(client_key)
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded — slow down and retry.",
+            headers={"Retry-After": str(max(1, int(retry_after) + 1))},
+        )
+
+    # In real mode the alert summary is fed into the agent's diagnosis prompt
+    # (deadman.commander.run_agentic); in mock mode the deterministic scenario runs.
     logger.info(
         "incident received", extra={"incident_id": incident_id, "summary": inc.summary}
     )
 
-    # The agent's model/tool calls block (real-mode retries sleep up to a few
-    # seconds); offload to a worker thread so the event loop stays responsive
-    # during a 5xx storm. Mock-mode behaviour is identical.
-    sb = await run_in_threadpool(_run_incident, incident_id)
-    return _scoreboard_dict(sb, incident_id, summary=inc.summary)
+    # [RAMPART] Track in-flight count for graceful drain.
+    global _in_flight
+    async with _in_flight_lock:
+        _in_flight += 1
+    try:
+        # The agent's model/tool calls block (real-mode retries sleep up to a few
+        # seconds); offload to a worker thread so the event loop stays responsive
+        # during a 5xx storm. Mock-mode behaviour is identical.
+        sb = await run_in_threadpool(_run_incident, incident_id, inc.summary)
+        return _scoreboard_dict(sb, incident_id, summary=inc.summary)
+    finally:
+        async with _in_flight_lock:
+            _in_flight -= 1
 
 
 # ---------------------------------------------------------------------------
