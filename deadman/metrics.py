@@ -52,10 +52,6 @@ class _NoOpHistogram:
     def observe(self, value):
         pass
 
-    @contextlib.contextmanager
-    def time(self) -> Generator:
-        yield
-
 
 # ── Metric definitions ─────────────────────────────────────────────────────────
 
