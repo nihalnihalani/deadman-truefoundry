@@ -16,6 +16,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
@@ -38,6 +39,7 @@ from deadman.chaos import Chaos
 from deadman.commander import NaiveAgent, Deadman, REVERT_KEY, action_key
 from deadman.mcp_gateway import KillSignal
 from deadman.state import AuditLog, DurableState
+from deadman.ratelimit import RateLimiter
 
 logger = logging.getLogger("deadman.webhook")
 
@@ -50,10 +52,73 @@ import deadman.metrics as _metrics  # noqa: E402
 configure_logging()
 
 # ---------------------------------------------------------------------------
+# [RAMPART] Rate limiter — configurable via DEADMAN_RATE_LIMIT_RPS env var.
+#
+# Default: 10 rps / burst 20 per client host.
+# Set DEADMAN_RATE_LIMIT_RPS=0 to disable (unlimited). Also always disabled
+# in tests when DEADMAN_RATE_LIMIT_RPS is unset (default=0 in that context).
+#
+# The default is intentionally 0 (disabled) when the env var is absent, so
+# that the existing test suite (which posts multiple incidents per test) is
+# never throttled. To enable in production, set DEADMAN_RATE_LIMIT_RPS=10.
+# ---------------------------------------------------------------------------
+
+_RATE_LIMIT_RPS: float = float(os.getenv("DEADMAN_RATE_LIMIT_RPS", "0"))
+_RATE_LIMIT_BURST: float = float(os.getenv("DEADMAN_RATE_LIMIT_BURST", str(max(1.0, _RATE_LIMIT_RPS * 2))))
+_incident_limiter = RateLimiter(rate_per_sec=_RATE_LIMIT_RPS, burst=_RATE_LIMIT_BURST)
+
+# ---------------------------------------------------------------------------
+# [RAMPART] Graceful shutdown state
+#
+# _shutting_down: set True on ASGI lifespan shutdown so /readyz returns 503
+#   (signals the load-balancer to stop routing new requests), while /healthz
+#   stays 200 (liveness probe — we are still alive, just draining).
+# _in_flight: counter of active /incident handler calls so we can drain them.
+# ---------------------------------------------------------------------------
+
+_shutting_down: bool = False
+_in_flight: int = 0
+_in_flight_lock = asyncio.Lock()
+
+# How long (seconds) to wait for in-flight handlers to drain before exiting.
+_DRAIN_TIMEOUT_SECONDS: float = float(os.getenv("DEADMAN_DRAIN_TIMEOUT_SECONDS", "10"))
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(application: FastAPI):
+    """Lifespan context manager: startup (no-op) + graceful shutdown drain."""
+    # ── startup ──────────────────────────────────────────────────────────────
+    yield
+    # ── shutdown ─────────────────────────────────────────────────────────────
+    global _shutting_down
+    _shutting_down = True
+    logger.info("shutdown signal received — draining in-flight requests")
+
+    # Poll until all in-flight /incident handlers have completed, or the drain
+    # timeout elapses (whichever comes first). Uses a short poll interval so we
+    # exit promptly when the queue is already empty.
+    _deadline = asyncio.get_event_loop().time() + _DRAIN_TIMEOUT_SECONDS
+    while True:
+        async with _in_flight_lock:
+            remaining = _in_flight
+        if remaining == 0:
+            break
+        if asyncio.get_event_loop().time() >= _deadline:
+            logger.warning(
+                "drain timeout — %d in-flight request(s) still active; exiting",
+                remaining,
+            )
+            break
+        await asyncio.sleep(0.05)
+
+    logger.info("drain complete")
+
+
+# ---------------------------------------------------------------------------
 # App + CORS
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="DEADMAN — resilient incident commander")
+app = FastAPI(title="DEADMAN — resilient incident commander", lifespan=_lifespan)
 
 # CORS: localhost dev origins only. We authenticate with a bearer/HMAC secret,
 # not cookies, so credentials are NOT allowed (avoids the credentialed-wildcard
@@ -246,11 +311,18 @@ def _run_incident(incident_id: str) -> "Scoreboard":  # type: ignore[name-define
 
 @app.get("/healthz")
 def healthz():
+    # Liveness: always 200 while the process is alive, even during drain.
     return {"ok": True, "mode": config.MODE}
 
 
 @app.get("/readyz")
 def readyz():
+    # Readiness: 503 while draining so the load balancer stops routing new requests.
+    if _shutting_down:
+        return JSONResponse(
+            status_code=503,
+            content={"ok": False, "reason": "shutting down", "mode": config.MODE},
+        )
     status = config.readiness()
     return JSONResponse(status_code=200 if status["ok"] else 503, content=status)
 
@@ -278,6 +350,16 @@ def metrics_endpoint():
 
 @app.post("/incident")
 async def handle_incident(inc: Incident, request: Request):
+    # [RAMPART] Rate-limit by client host (IP or forwarded header).
+    client_key = request.client.host if request.client else "unknown"
+    if not _incident_limiter.allow(client_key):
+        retry_after = _incident_limiter.retry_after(client_key)
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded — slow down and retry.",
+            headers={"Retry-After": str(max(1, int(retry_after) + 1))},
+        )
+
     incident_id = _validate_http_incident_id(inc.incident_id)
 
     # Optional shared-secret auth (no-op when DEADMAN_WEBHOOK_SECRET is unset).
@@ -292,11 +374,19 @@ async def handle_incident(inc: Incident, request: Request):
         "incident received", extra={"incident_id": incident_id, "summary": inc.summary}
     )
 
-    # The agent's model/tool calls block (real-mode retries sleep up to a few
-    # seconds); offload to a worker thread so the event loop stays responsive
-    # during a 5xx storm. Mock-mode behaviour is identical.
-    sb = await run_in_threadpool(_run_incident, incident_id)
-    return _scoreboard_dict(sb, incident_id, summary=inc.summary)
+    # [RAMPART] Track in-flight count for graceful drain.
+    global _in_flight
+    async with _in_flight_lock:
+        _in_flight += 1
+    try:
+        # The agent's model/tool calls block (real-mode retries sleep up to a few
+        # seconds); offload to a worker thread so the event loop stays responsive
+        # during a 5xx storm. Mock-mode behaviour is identical.
+        sb = await run_in_threadpool(_run_incident, incident_id)
+        return _scoreboard_dict(sb, incident_id, summary=inc.summary)
+    finally:
+        async with _in_flight_lock:
+            _in_flight -= 1
 
 
 # ---------------------------------------------------------------------------
