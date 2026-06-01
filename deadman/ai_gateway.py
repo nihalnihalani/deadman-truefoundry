@@ -29,7 +29,7 @@ class AIGateway:
         self.fallbacks = 0
         self.semantic_cache: dict[str, str] = {}
 
-    def _tier_healthy(self, t: dict) -> bool:
+    def _tier_healthy(self, t: config.TierConfig) -> bool:
         if self.chaos is None:
             return True
         return self.chaos.tier_healthy(t["tier"], t["region"])

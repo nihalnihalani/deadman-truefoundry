@@ -302,6 +302,7 @@ def _run_incident(incident_id: str, summary: str = "") -> "Scoreboard":  # type:
     """
     incident_id = config.validate_incident_id(incident_id)
     resume = DurableState(incident_id).pending is not None
+    world: World | RealWorld
     if config.is_real():
         world = RealWorld(audit_log=AuditLog(incident_id))
         return Deadman(incident_id, world, chaos=None).run_agentic(summary, resume=resume)
