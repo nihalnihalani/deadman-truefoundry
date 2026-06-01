@@ -6,35 +6,66 @@
 #
 # NOTE: field names below follow TrueFoundry's documented gateway config shape; verify
 # against your tenant's current schema (docs: truefoundry.com/docs/ai-gateway).
+#
+# MODEL IDs (June 2026):
+#   - The `model` field uses Bedrock's {provider-account}/{model} format for newer models,
+#     or the classic `provider.model-version:N` ARN suffix for GA models.
+#   - Exact modelId / inferenceProfileId strings are resolved at runtime via boto3
+#     (ListFoundationModels + ListInferenceProfiles) by deadman.realmode_ai.resolve_model_id().
+#     Newer Bedrock models prefer inference-profile prefixes (global./ or us.) for
+#     cross-region resilience; the runtime resolver prefers those over raw modelIds.
+#   - The ids below are the best-known explicit ids as of June 2026 and act as the
+#     fallback when boto3 resolution is unavailable.
+#
+# ROUTING METADATA:
+#   The TFY gateway surfaces its routing decision via x-tfy-* response headers, including:
+#     x-tfy-fallback-depth  — integer hop count (0 = primary served, 1 = first fallback, …)
+#     x-tfy-backend         — the backend model / target that served the request
+#     x-tfy-target-id       — the target id from this config that was used
+#     x-tfy-cache           — "hit" when the semantic cache answered
+#     x-tfy-retry-count     — retries consumed before the successful response
+#   deadman.realmode_ai.complete() reads these headers to populate Completion.tier and
+#   Completion.from_cache, which drive the Agent Gateway auto-leash.
 
 name: deadman-resilient-bedrock
 type: gateway-virtual-model
 
 # ---- the Bedrock fallback chain (each tier tagged in the trace) ----
 targets:
-  - id: claude-use1                       # tier 0 — primary
+  - id: claude-use1                       # tier 0 — primary brain
     provider: aws-bedrock
-    model: anthropic.claude-3-5-sonnet-20241022-v2:0
+    # Claude Opus 4.8 (released May 28 2026, 1M ctx) — us-east-1
+    # Best-known id; exact id resolved at runtime via boto3 (inference profile preferred).
+    model: anthropic.claude-opus-4-8-20260528-v1:0
     region: us-east-1
     weight: 100
     fallback_candidate: true
-  - id: claude-usw2                       # tier 1 — CROSS-REGION (the literal May 7-8 outage)
+
+  - id: claude-usw2                       # tier 1 — CROSS-REGION (the literal May 7-8 2026 us-east-1 outage)
     provider: aws-bedrock
-    model: anthropic.claude-3-5-sonnet-20241022-v2:0
+    # Claude Opus 4.8 — us-west-2 twin; same model, different region.
+    model: anthropic.claude-opus-4-8-20260528-v1:0
     region: us-west-2
     fallback_candidate: true
+
   - id: llama-usw2                        # tier 2 — CROSS-PROVIDER (still on Bedrock)
     provider: aws-bedrock
-    model: meta.llama3-1-70b-instruct-v1:0
+    # Llama 4 Maverick (1M ctx, released Q1 2026) — us-west-2
+    # Inference-profile id preferred: us.meta.llama4-maverick-17b-instruct-v1:0
+    model: meta.llama4-maverick-17b-instruct-v1:0
     region: us-west-2
     fallback_candidate: true
+
   - id: mistral-usw2                      # tier 3
     provider: aws-bedrock
-    model: mistral.mistral-large-2407-v1:0
+    # Mistral Large 3 (June 2026) — us-west-2
+    model: mistral.mistral-large-3-2506-v1:0
     region: us-west-2
     fallback_candidate: true
+
   - id: cohere-usw2                       # tier 4 — final live tier
     provider: aws-bedrock
+    # Cohere Command R+ — us-west-2
     model: cohere.command-r-plus-v1:0
     region: us-west-2
     fallback_candidate: true

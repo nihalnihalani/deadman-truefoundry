@@ -6,6 +6,12 @@ provider outage it loses everything; on a kill it restarts from scratch and DOUB
 Deadman: routes every model call through the AI Gateway (fallback chain) and every tool
 through the MCP Gateway (scoped + audited + idempotent), with the Agent Gateway revoking
 authority as the brain degrades. Survives provider death and resumes exactly-once.
+
+chaos=None is a valid and supported signature for Deadman. When chaos is None:
+  - AIGateway runs without injected failures (real/healthy path).
+  - MCPGateway runs without kill injection or corrupt-output simulation.
+  - Phase B deepening fires a real AI re-plan instead of toggling a chaos knob.
+  - All invariants (exactly-once, resume, scope, audit) are identical.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -58,9 +64,20 @@ class NaiveAgent:
 
 
 class Deadman:
-    """The commander that survives its own outage."""
+    """The commander that survives its own outage.
 
-    def __init__(self, incident_id: str, world, chaos):
+    Parameters
+    ----------
+    incident_id : str
+        Unique identifier for this incident (used as the durable-state key).
+    world : World | RealWorld
+        System-of-record adapter. Mock World for demo/tests; RealWorld for production.
+    chaos : Chaos | None
+        Chaos injection handle. Pass None in production / webhook path — every chaos
+        access in run() is guarded so that chaos=None never raises AttributeError.
+    """
+
+    def __init__(self, incident_id: str, world, chaos=None):
         self.incident_id = incident_id
         self.world = world
         self.chaos = chaos
@@ -122,9 +139,16 @@ class Deadman:
             except ScopeDenied as e:
                 sb.notes.append(str(e))
 
-        # --- Phase B: the outage DEEPENS (Anthropic fully unavailable now) -> auto-leash ---
-        self.chaos.down_tiers.add(1)                 # both Claude regions gone
-        self.ai.complete("re-plan mitigation under a deeper outage")  # -> deeper fallback
+        # --- Phase B: the outage DEEPENS -> auto-leash ---
+        # In chaos/demo mode: inject tier-1 failure and call the AI gateway for a re-plan.
+        # In production (chaos=None): just call the AI gateway — the real fallback depth
+        # comes from the AI Gateway's own tier-health probing (no chaos toggle needed).
+        if self.chaos is not None:
+            self.chaos.down_tiers.add(1)   # both Claude regions gone (demo only)
+
+        # Re-plan on the (now deeper) fallback chain — in real mode this naturally surfaces
+        # whatever depth the TFY AI Gateway resolved based on live Bedrock availability.
+        self.ai.complete("re-plan mitigation under a deeper outage")
         scope2 = self._scope()
         sb.fallback_depth = self.ai.max_depth
         sb.backend = "tier-%d" % self.ai.max_depth

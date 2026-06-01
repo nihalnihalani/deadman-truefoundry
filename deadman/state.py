@@ -1,8 +1,40 @@
 """Durable state + audit log — the crown jewel.
 
-Both are file-backed so they SURVIVE process death (the mock stand-in for DynamoDB +
-the TrueFoundry MCP Gateway's OpenTelemetry audit log). The audit log is load-bearing
-THREE ways: (1) recovery ledger, (2) exactly-once dedup on resume, (3) the postmortem.
+Pluggable backend selected by config.STATE_BACKEND:
+
+  "file"     (default) — byte-compatible with original behavior. Files live at
+             {STATE_DIR}/{incident_id}.state.json and {incident_id}.audit.jsonl.
+
+  "dynamodb" — production-grade, exactly-once at the storage layer via DynamoDB
+             conditional writes.
+
+  DynamoDB table schema
+  ---------------------
+  Table name: config.DYNAMODB_TABLE  (default: "deadman-incident-state")
+
+  Partition key  PK  (S)  — incident_id, e.g. "incident-42"
+  Sort key       SK  (S)  — record type + sub-key:
+      "STATE"              — the single mutable state item for the incident
+      "AUDIT#<seq>"        — monotonically increasing audit records
+                             seq is zero-padded 12-digit int, e.g. "AUDIT#000000000001"
+
+  State item attributes:
+      PK, SK="STATE", data (JSON-encoded state blob), version (N) for optimistic locking
+
+  Audit item attributes:
+      PK, SK="AUDIT#<seq>", status (S), tool (S), key (S), plus any extra fields from entry.
+      A CONDITIONAL write on the SK prevents duplicate COMMITTED records for the same
+      idempotency key: the condition `attribute_not_exists(PK)` ensures each SK is written
+      at most once. For the COMMITTED record specifically a separate GSI or scan checks
+      whether a COMMITTED record for `key` already exists before calling is_committed().
+
+  GSI (optional, for is_committed hot path):
+      GSI name: "KeyStatusIndex"
+      GSI PK: key (S), GSI SK: status (S) — allows is_committed(key) via a direct query
+      rather than a full partition scan.
+
+Both the file and DynamoDB paths satisfy the same public interface; the rest of the
+codebase never touches backend internals.
 """
 from __future__ import annotations
 import json
@@ -10,29 +42,235 @@ import os
 import deadman.config as config
 
 
-def _path(incident_id: str, name: str) -> str:
+# ---------------------------------------------------------------------------
+# helpers shared by both backends
+# ---------------------------------------------------------------------------
+
+def _file_path(incident_id: str, name: str) -> str:
     os.makedirs(config.STATE_DIR, exist_ok=True)
     return os.path.join(config.STATE_DIR, f"{incident_id}.{name}")
 
 
-class DurableState:
-    """Append-only incident state machine, OUTSIDE the model provider."""
+def _empty_state(incident_id: str) -> dict:
+    return {
+        "incident_id": incident_id,
+        "phase": "triage",
+        "actions_committed": [],
+        "pending_action": None,
+        "timeline": [],
+    }
+
+
+# ---------------------------------------------------------------------------
+# File backend (default — mock/demo/CI)
+# ---------------------------------------------------------------------------
+
+class FileBackend:
+    """Byte-compatible with the original state.py implementation."""
 
     def __init__(self, incident_id: str):
         self.incident_id = incident_id
-        self.path = _path(incident_id, "state.json")
-        self.data = self._load()
+        self._state_path = _file_path(incident_id, "state.json")
+        self._audit_path = _file_path(incident_id, "audit.jsonl")
 
-    def _load(self) -> dict:
-        if os.path.exists(self.path):
-            with open(self.path) as f:
+    # ---- state ----
+
+    def load_state(self) -> dict:
+        if os.path.exists(self._state_path):
+            with open(self._state_path) as f:
                 return json.load(f)
-        return {"incident_id": self.incident_id, "phase": "triage",
-                "actions_committed": [], "pending_action": None, "timeline": []}
+        return _empty_state(self.incident_id)
+
+    def save_state(self, data: dict):
+        with open(self._state_path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    # ---- audit ----
+
+    def append_audit(self, entry: dict):
+        with open(self._audit_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    def read_audit(self) -> list[dict]:
+        if not os.path.exists(self._audit_path):
+            return []
+        with open(self._audit_path) as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    # ---- is_committed: conditional write semantics (file version: check before write) ----
+
+    def is_committed(self, key: str) -> bool:
+        return any(
+            e.get("key") == key and e.get("status") == "COMMITTED"
+            for e in self.read_audit()
+        )
+
+    # ---- reset ----
+
+    def reset(self):
+        for p in (self._state_path, self._audit_path):
+            if os.path.exists(p):
+                os.remove(p)
+
+
+# ---------------------------------------------------------------------------
+# DynamoDB backend (production)
+# ---------------------------------------------------------------------------
+
+class DynamoDBBackend:
+    """Production DynamoDB backend.
+
+    boto3 is imported lazily so it is never required when running in file mode.
+
+    Table schema (reproduced from module docstring):
+      PK (S): incident_id
+      SK (S): "STATE" | "AUDIT#<seq>"
+    Audit items carry status/tool/key attributes used by is_committed().
+    Conditional writes on AUDIT items (`attribute_not_exists(PK)`) guarantee
+    each sort-key is written exactly once, making COMMITTED records idempotent
+    at the storage layer.
+    """
+
+    _SEQ_PAD = 12  # zero-padded sequence width
+
+    def __init__(self, incident_id: str):
+        # lazy import — never loaded when STATE_BACKEND == "file"
+        import boto3  # type: ignore
+        from botocore.exceptions import ClientError  # type: ignore  # noqa: F401
+        self._ClientError = ClientError
+
+        self.incident_id = incident_id
+        self._table_name = config.DYNAMODB_TABLE
+        self._dynamodb = boto3.resource("dynamodb", region_name=config.AWS_REGION)
+        self._table = self._dynamodb.Table(self._table_name)
+
+    def _state_key(self) -> dict:
+        return {"PK": self.incident_id, "SK": "STATE"}
+
+    def _audit_sk(self, seq: int) -> str:
+        return f"AUDIT#{seq:0{self._SEQ_PAD}d}"
+
+    def _next_seq(self) -> int:
+        """Count existing AUDIT items to derive the next monotonic sequence number."""
+        resp = self._table.query(
+            KeyConditionExpression="PK = :pk AND begins_with(SK, :pfx)",
+            ExpressionAttributeValues={":pk": self.incident_id, ":pfx": "AUDIT#"},
+            Select="COUNT",
+        )
+        return resp.get("Count", 0)
+
+    # ---- state ----
+
+    def load_state(self) -> dict:
+        resp = self._table.get_item(Key=self._state_key())
+        item = resp.get("Item")
+        if item:
+            return json.loads(item["data"])
+        return _empty_state(self.incident_id)
+
+    def save_state(self, data: dict):
+        self._table.put_item(Item={
+            **self._state_key(),
+            "data": json.dumps(data),
+        })
+
+    # ---- audit ----
+
+    def append_audit(self, entry: dict):
+        seq = self._next_seq()
+        sk = self._audit_sk(seq)
+        item = {
+            "PK": self.incident_id,
+            "SK": sk,
+            **{k: str(v) if not isinstance(v, str) else v for k, v in entry.items()},
+        }
+        # Conditional write: attribute_not_exists(PK) ensures each SK is written at most once.
+        # If a duplicate COMMITTED record arrives for the same SK, the condition fails and
+        # we swallow the ConditionalCheckFailedException — the record is already there.
+        try:
+            self._table.put_item(
+                Item=item,
+                ConditionExpression="attribute_not_exists(PK)",
+            )
+        except self._ClientError as exc:
+            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                pass  # idempotent: already written
+            else:
+                raise
+
+    def read_audit(self) -> list[dict]:
+        resp = self._table.query(
+            KeyConditionExpression="PK = :pk AND begins_with(SK, :pfx)",
+            ExpressionAttributeValues={":pk": self.incident_id, ":pfx": "AUDIT#"},
+            ScanIndexForward=True,
+        )
+        return list(resp.get("Items", []))
+
+    def is_committed(self, key: str) -> bool:
+        """Query for a COMMITTED record matching `key`.
+
+        Uses the GSI "KeyStatusIndex" (PK=key, SK=status) when available for O(1) lookup;
+        falls back to a linear scan of the partition's AUDIT items if the GSI is absent.
+        """
+        try:
+            resp = self._table.query(
+                IndexName="KeyStatusIndex",
+                KeyConditionExpression="#k = :key AND #s = :committed",
+                ExpressionAttributeNames={"#k": "key", "#s": "status"},
+                ExpressionAttributeValues={":key": key, ":committed": "COMMITTED", ":pk": self.incident_id},
+                FilterExpression="PK = :pk",
+                Select="COUNT",
+            )
+            return resp.get("Count", 0) > 0
+        except self._ClientError:
+            # GSI not provisioned: fall back to linear scan
+            return any(
+                e.get("key") == key and e.get("status") == "COMMITTED"
+                for e in self.read_audit()
+            )
+
+    # ---- reset ----
+
+    def reset(self):
+        """Delete all items for this incident from the table (state + audit)."""
+        resp = self._table.query(
+            KeyConditionExpression="PK = :pk",
+            ExpressionAttributeValues={":pk": self.incident_id},
+        )
+        with self._table.batch_writer() as batch:
+            for item in resp.get("Items", []):
+                batch.delete_item(Key={"PK": item["PK"], "SK": item["SK"]})
+
+
+# ---------------------------------------------------------------------------
+# Backend factory
+# ---------------------------------------------------------------------------
+
+def _make_backend(incident_id: str):
+    backend = config.STATE_BACKEND
+    if backend == "dynamodb":
+        return DynamoDBBackend(incident_id)
+    return FileBackend(incident_id)
+
+
+# ---------------------------------------------------------------------------
+# Public API — DurableState
+# ---------------------------------------------------------------------------
+
+class DurableState:
+    """Append-only incident state machine, OUTSIDE the model provider.
+
+    Delegates to a pluggable backend (FileBackend or DynamoDBBackend) selected
+    by config.STATE_BACKEND. The public interface is identical regardless of backend.
+    """
+
+    def __init__(self, incident_id: str):
+        self.incident_id = incident_id
+        self._backend = _make_backend(incident_id)
+        self.data = self._backend.load_state()
 
     def _flush(self):
-        with open(self.path, "w") as f:
-            json.dump(self.data, f, indent=2)
+        self._backend.save_state(self.data)
 
     def set_pending(self, action: str, key: str):
         self.data["pending_action"] = {"action": action, "key": key}
@@ -51,37 +289,63 @@ class DurableState:
     def pending(self):
         return self.data.get("pending_action")
 
+    # legacy path attribute so existing code/tests that reference .path still work
+    @property
+    def path(self) -> str:
+        if isinstance(self._backend, FileBackend):
+            return self._backend._state_path
+        return f"dynamodb://{config.DYNAMODB_TABLE}/{self.incident_id}/STATE"
+
+
+# ---------------------------------------------------------------------------
+# Public API — AuditLog
+# ---------------------------------------------------------------------------
 
 class AuditLog:
-    """Append-only JSONL — the MCP Gateway audit trail. is_committed() enforces exactly-once."""
+    """Append-only audit trail. is_committed() enforces exactly-once.
+
+    Delegates to the same backend as DurableState for the incident.
+    """
 
     def __init__(self, incident_id: str):
-        self.path = _path(incident_id, "audit.jsonl")
+        self.incident_id = incident_id
+        self._backend = _make_backend(incident_id)
 
     def write(self, entry: dict):
-        with open(self.path, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        self._backend.append_audit(entry)
 
-    def _entries(self):
-        if not os.path.exists(self.path):
-            return []
-        with open(self.path) as f:
-            return [json.loads(line) for line in f if line.strip()]
+    def _entries(self) -> list[dict]:
+        return self._backend.read_audit()
 
     def is_committed(self, key: str) -> bool:
-        return any(e.get("key") == key and e.get("status") == "COMMITTED" for e in self._entries())
+        return self._backend.is_committed(key)
 
     def pending_keys(self) -> list[str]:
-        committed = {e["key"] for e in self._entries() if e.get("status") == "COMMITTED"}
-        return [e["key"] for e in self._entries()
-                if e.get("status") == "PENDING" and e["key"] not in committed]
+        entries = self._entries()
+        committed = {e["key"] for e in entries if e.get("status") == "COMMITTED"}
+        return [
+            e["key"] for e in entries
+            if e.get("status") == "PENDING" and e["key"] not in committed
+        ]
 
     def postmortem(self) -> list[str]:
-        return [f"{e['status']:9} {e.get('tool','')} key={e.get('key','')}" for e in self._entries()]
+        return [
+            f"{e.get('status', '?'):9} {e.get('tool', '')} key={e.get('key', '')}"
+            for e in self._entries()
+        ]
 
+    # legacy path attribute
+    @property
+    def path(self) -> str:
+        if isinstance(self._backend, FileBackend):
+            return self._backend._audit_path
+        return f"dynamodb://{config.DYNAMODB_TABLE}/{self.incident_id}/AUDIT"
+
+
+# ---------------------------------------------------------------------------
+# Module-level reset (works for both backends)
+# ---------------------------------------------------------------------------
 
 def reset(incident_id: str):
-    for name in ("state.json", "audit.jsonl"):
-        p = _path(incident_id, name)
-        if os.path.exists(p):
-            os.remove(p)
+    """Remove all state and audit data for an incident. Works for both backends."""
+    _make_backend(incident_id).reset()

@@ -2,6 +2,17 @@
 # Apply with:  tfy apply -f infra/guardrails.yaml
 # Mirrors the AI Gateway -> Controls -> Guardrails model: WHEN REQUEST GOES TO /
 # FROM SUBJECTS / APPLY ON HOOKS (pre-tool, post-tool). Verify field names against your tenant.
+#
+# Python-side implementations (deadman/guardrails.py):
+#   - block-scale-to-zero          → guardrails.pre_tool_validate  (asg.scale replicas floor)
+#   - prod-drain-needs-elevation   → guardrails.pre_tool_validate  (k8s.cordon_drain elevation check)
+#   - redact-secrets-before-statuspage → guardrails.pre_tool_validate (hook point, no-op placeholder)
+#   - catch-corrupt-tool-output    → guardrails.post_tool_validate (JSON validity + truncation heuristic)
+#   - block-prompt-injection       → LLM-layer; no Python-side counterpart
+#
+# Agent Gateway autonomy coupling:
+#   - revoke_destructive_at_depth  → config.AUTONOMY_REVOKE_AT_DEPTH (depth 2)
+#     mirrored in agent_gateway.py AllowedScope logic
 
 # ---- MCP Gateway: scoped tool access with Cedar default-DENY on destructive verbs ----
 mcp_gateway:
@@ -23,6 +34,7 @@ mcp_gateway:
 
 guardrails:
   # ---- Pre-Tool: validate tool arguments BEFORE execution (denied call never runs) ----
+  # Python: guardrails.pre_tool_validate(tool, args) — asg.scale branch
   - name: block-scale-to-zero
     when_request_goes_to: { mcp_tool: asg.scale }
     from_subjects: [incident-commander]
@@ -30,6 +42,7 @@ guardrails:
     rule: "args.replicas >= 2"            # rejects a hallucinated 'scale to 0'
     on_violation: block
 
+  # Python: guardrails.pre_tool_validate(tool, args) — k8s.cordon_drain branch
   - name: prod-drain-needs-elevation
     when_request_goes_to: { mcp_tool: k8s.cordon_drain }
     from_subjects: [incident-commander]
@@ -37,6 +50,7 @@ guardrails:
     rule: "args.namespace not in PROD_CRITICAL or context.elevation == true"
     on_violation: block
 
+  # Python: guardrails.pre_tool_validate(tool, args) — statuspage hook point (no-op placeholder)
   - name: redact-secrets-before-statuspage
     when_request_goes_to: { mcp_tool: statuspage.post }
     apply_on_hooks: [pre-tool]
@@ -44,6 +58,7 @@ guardrails:
     redact: [secrets, pii, aws_keys]
 
   # ---- Post-Tool: inspect tool RESULTS before the model sees them (cascade-breaker) ----
+  # Python: guardrails.post_tool_validate(tool, raw, corrupt=...) — cw./logs. branch
   - name: catch-corrupt-tool-output
     when_request_goes_to: { mcp_tool: [cw.get_metrics, logs.query] }
     apply_on_hooks: [post-tool]
@@ -51,6 +66,7 @@ guardrails:
     on_violation: block_and_refetch       # don't let garbage poison the plan
 
   # ---- LLM input guardrail: block prompt-injection from hostile log output ----
+  # (no Python-side counterpart — enforced at gateway layer only)
   - name: block-prompt-injection
     when_request_goes_to: { model: deadman-resilient-bedrock }
     apply_on_hooks: [pre-llm]
@@ -58,7 +74,9 @@ guardrails:
     on_violation: block
 
 # ---- Agent Gateway: couple authority to confidence (the WOW). When the AI Gateway
-#      fallback depth crosses the threshold, auto-revoke destructive scope. ----
+#      fallback depth crosses the threshold, auto-revoke destructive scope.
+#      Python: config.AUTONOMY_REVOKE_AT_DEPTH = 2 (mirrors revoke_destructive_at_depth)
+#              agent_gateway.py AllowedScope checks fallback_depth against this value ----
 agent_gateway:
   autonomy_budget:
     subject: incident-commander
