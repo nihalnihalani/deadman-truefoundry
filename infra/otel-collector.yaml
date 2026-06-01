@@ -1,0 +1,32 @@
+# Minimal OpenTelemetry Collector config for DEADMAN local dev.
+#
+# Mounted by docker-compose.yml (profile: otel) at /etc/otelcol/config.yaml.
+# Receives OTLP spans from the app (deadman/otel.py exports to
+# OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317) and logs them.
+#
+# Swap the `debug` exporter for otlp/jaeger/datadog/etc. to ship spans onward.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  debug:
+    verbosity: detailed
+
+service:
+  telemetry:
+    metrics:
+      address: 0.0.0.0:8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]

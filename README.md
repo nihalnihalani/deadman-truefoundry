@@ -79,18 +79,25 @@ Two of the most screenshot-able artifacts in the whole hackathon: the *"we kille
 ### Code map (this repo)
 | File | Role |
 |---|---|
-| `deadman/ai_gateway.py` | Mock **AI Gateway** — fallback chain, latency-shed, semantic-cache runbook brain, fallback-depth signal |
-| `deadman/mcp_gateway.py` | Mock **MCP Gateway + Guardrails** — Cedar default-deny, Pre/Post-Tool hooks, **idempotency = exactly-once**, audit |
-| `deadman/agent_gateway.py` | Mock **Agent Gateway** — autonomy budget; revokes destructive scope as the brain degrades |
-| `deadman/state.py` | **Durable state + append-only audit log** (file-backed → survives process death) — the crown jewel |
-| `deadman/world.py` | The prod environment / system of record (where double-execution is observable) |
-| `deadman/commander.py` | `NaiveAgent` vs `Deadman` (the resumable commander) |
-| `deadman/chaos.py` | The chaos injector — every failure is a toggle |
+| `deadman/ai_gateway.py` | **AI Gateway** — fallback chain, latency-shed, semantic-cache runbook brain, fallback-depth signal (mock + real paths) |
+| `deadman/realmode_ai.py` | Real **AI Gateway** client — OpenAI-compatible TFY endpoint, `x-tfy-*` header→fallback-depth parsing, boto3 model-id resolution |
+| `deadman/mcp_gateway.py` | **MCP Gateway + Guardrails** — Cedar default-deny, Pre/Post-Tool hooks, **idempotency = exactly-once**, audit (mock + real paths) |
+| `deadman/realmode_mcp.py` | Real **MCP Gateway** client — `/tools/{tool}` with `Idempotency-Key`, retry/backoff |
+| `deadman/guardrails.py` | Pure Pre/Post-Tool validators (single source of truth, shared by both paths) |
+| `deadman/agent_gateway.py` | **Agent Gateway** — autonomy budget; latching revoke of destructive scope as the brain degrades + kill-switch |
+| `deadman/state.py` | **Durable state + audit log** — pluggable `FileBackend` / `DynamoDBBackend`, race-safe `claim_commit` — the crown jewel |
+| `deadman/world.py` | `World` (mock system of record) + `RealWorld` (queries the live provider for reconciliation) |
+| `deadman/commander.py` | `NaiveAgent` vs `Deadman` (the resumable commander; runs with `chaos=None` in production) |
+| `deadman/webhook.py` | FastAPI entrypoint — `/incident` (auth-gated), demo/SSE/chaos API, static UI mount, OTel |
+| `deadman/otel.py` | Lazy OpenTelemetry init (no-op when unconfigured) |
+| `deadman/chaos.py` | The chaos injector — every failure is a toggle (demo only) |
+| `web/` | The split-screen chaos UI + live Resilience Scoreboard (vanilla JS, no build step) |
+| `tests/` | 133-test pytest suite (exactly-once, guardrails, fallback, auto-leash, webhook, real clients) |
 | `scripts/prove_exactly_once.py` | **Day-1 gate:** kill mid-rollback, resume, assert exactly-once |
 | `scripts/run_demo.py` | The split-screen chaos demo + Resilience Scoreboard |
 
 ### The Bedrock fallback chain (tag each tier in the trace)
-`Claude 3.5 Sonnet @ us-east-1` → `Claude 3.5 Sonnet @ us-west-2` → `Llama 3.1 70B` → `Mistral Large` → `Cohere Command R+` → `semantic cache`. Fallback on 429/500/502/503; **latency-shed when p99 breaches budget**.
+`Claude Opus 4.8 @ us-east-1` → `Claude Opus 4.8 @ us-west-2` → `Llama 4 Maverick` → `Mistral Large 3` → `Cohere Command R+` → `semantic cache`. Fallback on 401/403/404/429/5xx; **latency-shed when p99 breaches budget**. The exact Bedrock `modelId` strings (which carry `global.`/`us.` inference-profile prefixes and change as models are deprecated) are resolved at startup via `boto3 ListFoundationModels` / inference-profiles — see `deadman/realmode_ai.resolve_model_id` — so we never ship a stale hardcoded ARN.
 
 ---
 
@@ -116,10 +123,31 @@ Ready-to-edit configs ship in [`infra/`](./infra):
    `k8s.cordon_drain`/`asg.scale`/`github.revert_pr`, the Pre/Post-Tool guardrails, the OTel audit
    log, and the **Agent Gateway** autonomy-budget coupling (revoke destructive scope at fallback depth 2).
 3. Set `DEADMAN_MODE=real` + the keys in `.env.example`. `deadman/ai_gateway.py` then calls the
-   OpenAI-compatible gateway via `deadman/realmode.py`; tools route through `realmode.call_tool` (MCP Gateway).
+   OpenAI-compatible gateway via `deadman/realmode_ai.py` (it reads the `x-tfy-*` response headers
+   to recover the fallback depth that drives the auto-leash); tools route through
+   `deadman/realmode_mcp.py` → the MCP Gateway with an `Idempotency-Key` header.
 4. Run the webhook a PagerDuty/CloudWatch alarm hits: `uvicorn deadman.webhook:app --port 8080`.
+   Set `DEADMAN_WEBHOOK_SECRET` to require a bearer token / HMAC signature on `/incident`, and
+   `DEADMAN_ENABLE_DEMO=0` to disable the demo + chaos endpoints in a real deployment.
 
 The mock and real paths share the same agent logic — only the gateway clients swap.
+
+### Exactly-once: the honest model
+The headline claim — *exactly-once across process death* — is enforced by three layers, not magic:
+1. **Provider-side idempotency.** Every destructive tool call carries an `Idempotency-Key`; the
+   MCP Gateway / provider dedupes a replay of the same key (the primary guarantee, the same pattern
+   Stripe uses).
+2. **A race-safe durable ledger.** `AuditLog.claim_commit(key)` records the COMMIT atomically
+   (file: an `flock`-guarded append; DynamoDB: a conditional `PutItem` on `COMMIT#{key}`), so two
+   workers can't both record success and the check-then-commit window is closed.
+3. **Live reconciliation on resume.** A fresh process rehydrates from the durable state + audit log
+   and, for a `PENDING`-not-`COMMITTED` action, **queries the live system of record**
+   (`RealWorld.is_reverted` → a read-only MCP tool) before re-acting — so it never re-fires a
+   destructive action that already happened.
+
+> The `scripts/run_demo.py` SSE stream animates intermediate beats with scripted pacing for the
+> split-screen UI; the headline **Double-executions NAIVE:1 / DEADMAN:0** is computed from a real
+> run of both agents, and `scripts/prove_exactly_once.py` asserts the invariant.
 
 ---
 

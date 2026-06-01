@@ -1,0 +1,64 @@
+version: "3.9"
+
+# Run the app only:
+#   docker compose up deadman
+#
+# Run with DynamoDB local (no AWS creds needed):
+#   docker compose --profile local-db up
+#
+# Run with OTel collector (Grafana/Jaeger):
+#   docker compose --profile otel up
+
+services:
+
+  deadman:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      # Override state backend to file when running standalone (no DynamoDB local needed).
+      DEADMAN_STATE_BACKEND: ${DEADMAN_STATE_BACKEND:-file}
+    volumes:
+      # Persist file-backend state across container restarts.
+      - deadman-state:/app/.deadman_state
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------
+  # Optional: DynamoDB local (profile: local-db)
+  # Set DEADMAN_STATE_BACKEND=dynamodb and
+  # AWS_ENDPOINT_URL=http://dynamodb-local:8000 in .env to use it.
+  # ----------------------------------------------------------------
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    profiles:
+      - local-db
+    ports:
+      - "8000:8000"
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+
+  # ----------------------------------------------------------------
+  # Optional: OpenTelemetry Collector (profile: otel)
+  # Set OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317 in .env
+  # ----------------------------------------------------------------
+  otel-collector:
+    image: otel/opentelemetry-collector:latest
+    profiles:
+      - otel
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8888:8888"   # Collector metrics
+    volumes:
+      - ./infra/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+
+volumes:
+  deadman-state:

@@ -1,8 +1,33 @@
 # The mock demo runs on the Python stdlib — no install needed:
 #     python scripts/run_demo.py
-# Install these for real mode (TrueFoundry AI Gateway + MCP Gateway + Bedrock):
-boto3>=1.34
-openai>=1.30            # TrueFoundry AI Gateway is OpenAI-compatible
+#
+# Install these for the web server + real mode
+# (TrueFoundry AI Gateway + MCP Gateway + Bedrock):
+
+# Web server
 fastapi>=0.110
-uvicorn>=0.29
+uvicorn[standard]>=0.29
 python-dotenv>=1.0
+
+# SSE (Server-Sent Events for /api/demo/stream)
+sse-starlette>=1.6
+
+# HTTP client (real-mode MCP calls + healthcheck)
+requests>=2.31
+
+# Real-mode AI Gateway (OpenAI-compatible TFY endpoint)
+openai>=1.30
+
+# Real-mode + DynamoDB state backend
+boto3>=1.34
+
+# Testing
+pytest>=8.0
+
+# ---------------------------------------------------------------
+# OPTIONAL: OpenTelemetry — comment out to keep the image slim.
+# Enable by uncommenting and rebuilding when OTEL_EXPORTER_OTLP_ENDPOINT is set.
+# ---------------------------------------------------------------
+# opentelemetry-sdk>=1.24
+# opentelemetry-exporter-otlp-proto-grpc>=1.24
+# opentelemetry-instrumentation-fastapi>=0.45b0

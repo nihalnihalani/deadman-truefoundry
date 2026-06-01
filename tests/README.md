@@ -1,0 +1,1 @@
+DEADMAN QA test suite. Run all tests from the repo root with `python3 -m pytest -q`. Each test is hermetic: state is isolated per-test via a `tmp_path`-backed `STATE_DIR` (conftest.py `isolated_state` fixture), MODE is forced to `mock`, and real-mode client tests monkeypatch their transports so no network calls are ever made.
