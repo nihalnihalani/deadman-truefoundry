@@ -795,24 +795,29 @@ class TestKillSwitchTrips:
 
     # ── run() integration: guardrail blocks accumulate and trip the switch ────
 
-    def test_run_guardrail_blocks_trip_kill_switch(self, isolated_state):
-        """In run(), when guardrail_blocks / tool_attempts >= 0.5, kill-switch trips."""
+    def test_run_single_block_does_not_trip_kill_switch(self, isolated_state):
+        """A SINGLE isolated guardrail block with a healthy brain must NOT trip the
+        kill-switch (it is meant for a *spike* of blocks, not one diagnostic). The block
+        is still recorded, but destructive authority is not revoked.
+        """
         incident_id = "kill-switch-run-01"
         state_module.reset(incident_id)
 
         world = World()
         chaos = Chaos()
-        # Arm corrupt_output so the cw.get_metrics post-tool guardrail fires
+        # Only corrupt_output: a single cw.get_metrics post-tool block, brain stays tier-0.
         chaos.corrupt_output = True
         agent = Deadman(incident_id, world, chaos)
         sb = agent.run()
 
-        # drain_authority must be OFF after the kill-switch trips
-        assert sb.drain_authority == "OFF"
-        any_trip_note = any("kill-switch TRIPPED" in n for n in sb.notes)
-        assert any_trip_note, (
-            f"Expected 'kill-switch TRIPPED' note when corrupt_output=True. Notes: {sb.notes}"
+        # The block is recorded ...
+        assert sb.guardrail_blocks >= 1
+        # ... but a single block (rate below the min-attempts floor) must NOT trip the switch.
+        assert not any("kill-switch TRIPPED" in n for n in sb.notes), (
+            f"single block should NOT trip the kill-switch. Notes: {sb.notes}"
         )
+        # Healthy brain (tier-0) + no spike => destructive authority retained.
+        assert sb.drain_authority == "ON"
 
     # ── run_agentic integration: repeated guardrail blocks trip the switch ────
 
@@ -854,10 +859,14 @@ class TestKillSwitchTrips:
         agent.ai.complete = scripted_complete  # type: ignore[method-assign]
         sb = agent.run_agentic("metrics spike", max_steps=6)
 
-        # Kill-switch should trip OR drain authority should be OFF after repeated blocks
-        # (exact behaviour depends on guardrail counts vs attempts)
-        # At minimum: survived is True (loop completes normally)
+        # Four blocked cw.get_metrics steps (>= the min-attempts floor, rate 1.0) MUST trip
+        # the kill-switch — this is the legitimate "spike of blocks" the control exists for.
         assert sb.survived is True
+        assert agent.agentgw.revoked is True, "repeated blocks should trip the kill-switch"
+        assert sb.drain_authority == "OFF"
+        assert any("kill-switch TRIPPED" in n for n in sb.notes), (
+            f"Expected a kill-switch trip after 4 blocked steps. Notes: {sb.notes}"
+        )
 
     def test_kill_switch_trip_via_trip_kill_switch_directly(self, isolated_state):
         """AgentGateway.trip_kill_switch revokes and drain_authority goes OFF."""

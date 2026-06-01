@@ -48,6 +48,13 @@ class Scoreboard:
     notes: list = field(default_factory=list)
 
 
+# The guardrail-block-rate kill-switch is meant to catch a *spike* of blocks (a brain
+# repeatedly attempting unsafe actions), not a single isolated block. Require a minimum
+# sample of tool attempts before the rate is meaningful, so one blocked diagnostic can't
+# latch full destructive-scope revocation.
+KILL_SWITCH_MIN_ATTEMPTS = 3
+
+
 def action_key(incident_id: str, action: str, target: str) -> str:
     """Stable per-incident idempotency key for provider-side deduplication."""
     return f"{config.validate_incident_id(incident_id)}::{action}::{target}"
@@ -196,7 +203,7 @@ class Deadman:
         # Primary control is the TFY gateway block-prompt-injection guardrail; this is
         # defense-in-depth matching infra/guardrails.yaml kill_switch_block_rate_threshold: 0.5.
         _block_rate_a = self.mcp.guardrail_blocks / max(1, _tool_attempts)
-        if self.agentgw.trip_kill_switch(_block_rate_a):
+        if _tool_attempts >= KILL_SWITCH_MIN_ATTEMPTS and self.agentgw.trip_kill_switch(_block_rate_a):
             sb.notes.append(
                 f"kill-switch TRIPPED (phase-A block rate {_block_rate_a:.2f} >= 0.5) "
                 "— destructive scope revoked"
@@ -233,7 +240,7 @@ class Deadman:
         # Recompute with the full attempt count; the latch means a previously-tripped
         # switch stays revoked even if the rate dropped (harmless for subsequent scope calls).
         _block_rate_b = self.mcp.guardrail_blocks / max(1, _tool_attempts)
-        if self.agentgw.trip_kill_switch(_block_rate_b):
+        if _tool_attempts >= KILL_SWITCH_MIN_ATTEMPTS and self.agentgw.trip_kill_switch(_block_rate_b):
             if "kill-switch TRIPPED" not in " ".join(sb.notes):
                 sb.notes.append(
                     f"kill-switch TRIPPED (phase-B block rate {_block_rate_b:.2f} >= 0.5) "
@@ -415,7 +422,7 @@ class Deadman:
                     # Kill-switch: check rate after every guardrail block so the next
                     # iteration's _scope() call immediately honors the trip.
                     _block_rate = self.mcp.guardrail_blocks / max(1, _total_tool_attempts)
-                    if self.agentgw.trip_kill_switch(_block_rate):
+                    if _total_tool_attempts >= KILL_SWITCH_MIN_ATTEMPTS and self.agentgw.trip_kill_switch(_block_rate):
                         sb.notes.append(
                             f"kill-switch TRIPPED (block rate {_block_rate:.2f} >= 0.5) "
                             "— destructive scope revoked for remaining steps"
@@ -438,7 +445,7 @@ class Deadman:
         # Catches the case where the rate crossed the threshold late in the loop but
         # no individual guardrail block triggered the per-step check above.
         _final_rate = self.mcp.guardrail_blocks / max(1, _total_tool_attempts)
-        if self.agentgw.trip_kill_switch(_final_rate):
+        if _total_tool_attempts >= KILL_SWITCH_MIN_ATTEMPTS and self.agentgw.trip_kill_switch(_final_rate):
             if not any("kill-switch TRIPPED" in n for n in sb.notes):
                 sb.notes.append(
                     f"kill-switch TRIPPED (final block rate {_final_rate:.2f} >= 0.5) "
