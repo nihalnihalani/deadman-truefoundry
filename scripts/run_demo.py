@@ -12,10 +12,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from deadman import state
 from deadman.world import World
 from deadman.chaos import Chaos
-from deadman.commander import NaiveAgent, Deadman, REVERT_KEY
+from deadman.commander import NaiveAgent, Deadman, action_key
 from deadman.mcp_gateway import KillSignal
 
 INCIDENT = "demo-incident-42"
+REVERT_KEY = action_key(INCIDENT, "revert_pr", "PR-1337")
 
 
 def run_naive():

@@ -1,6 +1,9 @@
 # syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 # Non-root user
 RUN addgroup --system deadman && adduser --system --ingroup deadman deadman
 
@@ -12,7 +15,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application source. .dockerignore excludes .git, .deadman_state/, tests/,
 # docs/, __pycache__, .env, *.pyc, .venv so the image stays minimal.
-COPY . .
+COPY --chown=deadman:deadman . .
+
+RUN mkdir -p /app/.deadman_state && chown -R deadman:deadman /app/.deadman_state
 
 # Drop to non-root
 USER deadman

@@ -6,7 +6,7 @@
 # Python-side implementations (deadman/guardrails.py):
 #   - block-scale-to-zero          → guardrails.pre_tool_validate  (asg.scale replicas floor)
 #   - prod-drain-needs-elevation   → guardrails.pre_tool_validate  (k8s.cordon_drain elevation check)
-#   - redact-secrets-before-statuspage → guardrails.pre_tool_validate (hook point, no-op placeholder)
+#   - redact-secrets-before-statuspage → guardrails.pre_tool_validate (client-side redaction)
 #   - catch-corrupt-tool-output    → guardrails.post_tool_validate (JSON validity + truncation heuristic)
 #   - block-prompt-injection       → LLM-layer; no Python-side counterpart
 #
@@ -50,7 +50,7 @@ guardrails:
     rule: "args.namespace not in PROD_CRITICAL or context.elevation == true"
     on_violation: block
 
-  # Python: guardrails.pre_tool_validate(tool, args) — statuspage hook point (no-op placeholder)
+  # Python: guardrails.pre_tool_validate(tool, args) — client-side redaction before gateway call
   - name: redact-secrets-before-statuspage
     when_request_goes_to: { mcp_tool: statuspage.post }
     apply_on_hooks: [pre-tool]

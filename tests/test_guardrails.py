@@ -78,6 +78,24 @@ class TestPreToolGuardrail:
         pre_tool_validate("cw.get_metrics", {"metric": "cpu"})
         pre_tool_validate("logs.query", {"query": "error"})
 
+    def test_statuspage_post_redacts_common_secrets(self):
+        """statuspage.post mutates its payload to remove common secret forms."""
+        args = {
+            "message": (
+                "incident update token=abc123 "
+                "Authorization: Bearer secret-token "
+                "AKIA1234567890ABCDEF"
+            ),
+            "nested": {"api_key": "sk-live-123"},
+        }
+
+        pre_tool_validate("statuspage.post", args)
+
+        assert "abc123" not in args["message"]
+        assert "secret-token" not in args["message"]
+        assert "AKIA1234567890ABCDEF" not in args["message"]
+        assert args["nested"]["api_key"] == "[REDACTED]"
+
     # ---- integration: MCPGateway tracks guardrail_blocks count ----
 
     def test_mcp_gateway_tracks_asg_scale_block(self, isolated_state):

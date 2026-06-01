@@ -57,6 +57,8 @@ def call_tool(tool: str, args: dict, idempotency_key: str) -> dict:
         After exhausting retries on retryable failures, or immediately on
         non-retryable failures (4xx other than 409).  Never silently succeeds.
     """
+    config.require_mcp_gateway_config()
+
     # Lazy import — requests is only needed in real mode; mock mode has zero deps.
     import requests  # noqa: PLC0415
 

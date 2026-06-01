@@ -9,7 +9,7 @@ import pytest
 import deadman.state as state_module
 from deadman.world import World
 from deadman.chaos import Chaos
-from deadman.commander import NaiveAgent, Deadman, REVERT_KEY
+from deadman.commander import NaiveAgent, Deadman, action_key
 from deadman.mcp_gateway import KillSignal
 
 
@@ -49,7 +49,7 @@ class TestNaiveVsDeadman:
         world = World()
         chaos = Chaos()
         chaos.correlated_blackout()
-        chaos.kill_process_after(REVERT_KEY)
+        chaos.kill_process_after(action_key(incident_id, "revert_pr", "PR-1337"))
 
         agent = Deadman(incident_id, world, chaos)
         try:
@@ -79,7 +79,7 @@ class TestNaiveVsDeadman:
         dm_world = World()
         dm_chaos = Chaos()
         dm_chaos.correlated_blackout()
-        dm_chaos.kill_process_after(REVERT_KEY)
+        dm_chaos.kill_process_after(action_key(incident_id, "revert_pr", "PR-1337"))
         dm_agent = Deadman(incident_id, dm_world, dm_chaos)
         try:
             dm_agent.run()

@@ -19,6 +19,9 @@ def isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "STATE_DIR", state_dir)
     # Also ensure MODE is mock (tests never make real network calls)
     monkeypatch.setattr(config, "MODE", "mock")
+    monkeypatch.setattr(config, "STATE_BACKEND", "file")
+    monkeypatch.delenv("DEADMAN_ENABLE_DEMO", raising=False)
+    monkeypatch.delenv("DEADMAN_WEBHOOK_SECRET", raising=False)
     yield state_dir
 
 

@@ -141,6 +141,8 @@ def complete(prompt: str) -> dict:
     Raises:
         openai.OpenAIError  — on hard gateway failure (caller should catch)
     """
+    config.require_ai_gateway_config()
+
     # Lazy import — keeps mock mode free of the openai dependency.
     import openai  # type: ignore[import]
 

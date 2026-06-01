@@ -1,4 +1,4 @@
-.PHONY: demo prove web serve test docker-build docker-up ui
+.PHONY: demo prove web serve test check compose-check docker-build docker-up ui
 
 # ── Demo / proof targets ────────────────────────────────────────────────────
 
@@ -24,6 +24,11 @@ ui:     ## Open the split-screen web UI in the browser (starts server if needed)
 
 test:   ## Run pytest suite
 	python3 -m pytest -v
+
+check: test prove demo compose-check  ## Run local production-readiness gates
+
+compose-check:  ## Validate docker compose configuration without starting containers
+	docker compose config >/dev/null
 
 # ── Docker targets ──────────────────────────────────────────────────────────
 

@@ -19,8 +19,6 @@ from dataclasses import dataclass, field
 import deadman.config as config
 from deadman.ai_gateway import AIGateway, ModelOutage
 from deadman.mcp_gateway import MCPGateway, KillSignal, GuardrailBlock, ScopeDenied
-DIAG_KEY = "incident-42::cw.get_metrics::read"
-CORDON_KEY = "incident-42::cordon_drain::prod-node-7"
 from deadman.agent_gateway import AgentGateway
 from deadman.state import DurableState, AuditLog
 
@@ -37,8 +35,15 @@ class Scoreboard:
     notes: list = field(default_factory=list)
 
 
-# The incident plan: the destructive step (revert_pr) is the one the kill targets.
-REVERT_KEY = "incident-42::revert_pr::PR-1337"
+def action_key(incident_id: str, action: str, target: str) -> str:
+    """Stable per-incident idempotency key for provider-side deduplication."""
+    return f"{config.validate_incident_id(incident_id)}::{action}::{target}"
+
+
+# Backwards-compatible demo constants. Production code uses per-incident keys below.
+DIAG_KEY = action_key("incident-42", "cw.get_metrics", "read")
+CORDON_KEY = action_key("incident-42", "cordon_drain", "prod-node-7")
+REVERT_KEY = action_key("incident-42", "revert_pr", "PR-1337")
 
 
 class NaiveAgent:
@@ -78,14 +83,17 @@ class Deadman:
     """
 
     def __init__(self, incident_id: str, world, chaos=None):
-        self.incident_id = incident_id
+        self.incident_id = config.validate_incident_id(incident_id)
         self.world = world
         self.chaos = chaos
-        self.state = DurableState(incident_id)
-        self.audit = AuditLog(incident_id)
+        self.state = DurableState(self.incident_id)
+        self.audit = AuditLog(self.incident_id)
         self.ai = AIGateway(chaos)
         self.agentgw = AgentGateway()
         self.mcp = MCPGateway(world, self.audit, chaos)
+        self.diag_key = action_key(self.incident_id, "cw.get_metrics", "read")
+        self.revert_key = action_key(self.incident_id, "revert_pr", "PR-1337")
+        self.cordon_key = action_key(self.incident_id, "cordon_drain", "prod-node-7")
 
     def _scope(self) -> set:
         return self.agentgw.allowed_scope(self.ai.max_depth)
@@ -119,19 +127,19 @@ class Deadman:
 
         # --- governed diagnostic read; Post-Tool guardrail catches a corrupt/garbage result ---
         try:
-            self.mcp.execute("cw.get_metrics", {"_returns": {"cpu": 0.9}}, DIAG_KEY, scope)
+            self.mcp.execute("cw.get_metrics", {"_returns": {"cpu": 0.9}}, self.diag_key, scope)
         except GuardrailBlock as e:
             sb.notes.append(str(e))   # caught the bad intermediate output -> would re-fetch
 
         # --- the destructive action: revert PR-1337, idempotency-keyed, governed, audited ---
-        if not self.audit.is_committed(REVERT_KEY):
-            self.state.set_pending("github.revert_pr", REVERT_KEY)
+        if not self.audit.is_committed(self.revert_key):
+            self.state.set_pending("github.revert_pr", self.revert_key)
             try:
                 # If authority was revoked, restore it for the *reconciliation* of an in-flight
                 # action (we only skip NEW destructive actions; finishing a committed one is safe).
                 act_scope = scope | {"github.revert_pr"} if self.world.is_reverted("PR-1337") else scope
-                self.mcp.execute("github.revert_pr", {"pr": "PR-1337"}, REVERT_KEY, act_scope)
-                self.state.commit("github.revert_pr", REVERT_KEY)
+                self.mcp.execute("github.revert_pr", {"pr": "PR-1337"}, self.revert_key, act_scope)
+                self.state.commit("github.revert_pr", self.revert_key)
             except KillSignal:
                 sb.state_losses += 0  # state is durable -> NOT lost
                 sb.notes.append("KILLED mid-rollback (between side effect and COMMIT)")
@@ -156,7 +164,7 @@ class Deadman:
         if self.agentgw.revoked:
             sb.notes.append("brain degraded to tier-%d -> Agent Gateway AUTO-LEASH: destructive authority REVOKED" % self.ai.max_depth)
         try:
-            self.mcp.execute("k8s.cordon_drain", {"node": "prod-node-7"}, CORDON_KEY, scope2)
+            self.mcp.execute("k8s.cordon_drain", {"node": "prod-node-7"}, self.cordon_key, scope2)
         except ScopeDenied as e:
             sb.notes.append("blocked a risky cordon_drain on a degraded brain -> " + str(e))
 

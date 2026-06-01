@@ -18,6 +18,7 @@ Design notes
 """
 from __future__ import annotations
 import json
+import re
 import deadman.config as config
 
 
@@ -38,6 +39,38 @@ PROD_CRITICAL_NAMESPACES: frozenset[str] = frozenset({
     "production", "prod", "prod-eu", "prod-us", "prod-ap", "prod-critical",
 })
 
+_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED_AWS_ACCESS_KEY]"),
+    (re.compile(r"(?i)(aws_secret_access_key\s*=\s*)[A-Za-z0-9/+=]{24,}"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(authorization:\s*bearer\s+)[A-Za-z0-9._~+/=-]+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(token|api[_-]?key|password|secret)(\s*[:=]\s*)[^\s,;]+"), r"\1\2[REDACTED]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"), "[REDACTED_JWT]"),
+)
+
+
+def redact_text(text: str) -> str:
+    """Redact common secret forms before status updates or model-visible text."""
+    redacted = text
+    for pattern, replacement in _SECRET_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+def _redact_payload(value):
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, dict):
+        redacted = {}
+        for k, v in value.items():
+            if re.search(r"(?i)(token|api[_-]?key|password|secret)", str(k)):
+                redacted[k] = "[REDACTED]"
+            else:
+                redacted[k] = _redact_payload(v)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_payload(v) for v in value]
+    return value
+
 
 def pre_tool_validate(tool: str, args: dict) -> None:
     """Validate tool + args BEFORE the side-effect is executed.
@@ -52,11 +85,11 @@ def pre_tool_validate(tool: str, args: dict) -> None:
     ② k8s.cordon_drain on a prod-critical namespace without elevation
         → prod-drain-needs-elevation: destructive drain of a live namespace
           requires an explicit elevation token in the call args.
-    ③ statuspage.post secret/PII redaction
-        → redact-secrets-before-statuspage: in the real TFY gateway the
-          YAML rule handles this server-side; here we document the hook point
-          so a future Python-side pass can strip secrets before the call
-          reaches the gateway (currently no-op, defense-in-depth if needed).
+    ③ statuspage.post secret redaction
+        → redact-secrets-before-statuspage: strip common credentials from the
+          client payload before it reaches either the model-visible audit trail
+          or the real gateway. The TFY gateway rule remains the server-side
+          backstop.
     """
     # ① asg.scale floor check
     if tool == "asg.scale":
@@ -76,12 +109,10 @@ def pre_tool_validate(tool: str, args: dict) -> None:
                 f"'{namespace}' requires args['elevation'] to be truthy"
             )
 
-    # ③ statuspage secret-redaction hook point
-    # When tool == "statuspage.post" we could strip secrets/PII here before the
-    # payload reaches the gateway.  The TFY guardrails.yaml rule
-    # (redact-secrets-before-statuspage) handles this server-side; this is a
-    # belt-and-suspenders client-side no-op placeholder.
-    # Future: scan args["message"] for AWS key patterns, JWTs, etc. and redact.
+    # ③ statuspage secret redaction. Mutates args in place so callers keep the
+    # same API while sending the safer payload downstream.
+    if tool == "statuspage.post":
+        args.update(_redact_payload(dict(args)))
 
 
 # ── Post-Tool validator ───────────────────────────────────────────────────────

@@ -19,6 +19,9 @@ python scripts/prove_exactly_once.py
 
 # The split-screen chaos demo: naive agent vs DEADMAN + the Resilience Scoreboard
 python scripts/run_demo.py
+
+# Full local readiness gate: pytest + exactly-once proof + demo + compose config
+make check
 ```
 No API keys, no install — the mock gateways + a file-backed durable store let the full
 **detect → fall back → guardrail → kill → resume exactly-once** loop run today. Set
@@ -92,7 +95,7 @@ Two of the most screenshot-able artifacts in the whole hackathon: the *"we kille
 | `deadman/otel.py` | Lazy OpenTelemetry init (no-op when unconfigured) |
 | `deadman/chaos.py` | The chaos injector — every failure is a toggle (demo only) |
 | `web/` | The split-screen chaos UI + live Resilience Scoreboard (vanilla JS, no build step) |
-| `tests/` | 133-test pytest suite (exactly-once, guardrails, fallback, auto-leash, webhook, real clients) |
+| `tests/` | Pytest suite (exactly-once, guardrails, fallback, auto-leash, webhook, production readiness, real clients) |
 | `scripts/prove_exactly_once.py` | **Day-1 gate:** kill mid-rollback, resume, assert exactly-once |
 | `scripts/run_demo.py` | The split-screen chaos demo + Resilience Scoreboard |
 
@@ -128,9 +131,24 @@ Ready-to-edit configs ship in [`infra/`](./infra):
    `deadman/realmode_mcp.py` → the MCP Gateway with an `Idempotency-Key` header.
 4. Run the webhook a PagerDuty/CloudWatch alarm hits: `uvicorn deadman.webhook:app --port 8080`.
    Set `DEADMAN_WEBHOOK_SECRET` to require a bearer token / HMAC signature on `/incident`, and
-   `DEADMAN_ENABLE_DEMO=0` to disable the demo + chaos endpoints in a real deployment.
+   leave `DEADMAN_ENABLE_DEMO` unset (or set it to `0`) so demo + chaos endpoints stay disabled
+   in real mode. Check `/readyz` before routing real alerts; it returns 503 until required real
+   mode config is present and unsafe demo/auth settings are closed.
 
 The mock and real paths share the same agent logic — only the gateway clients swap.
+
+### Production readiness checklist
+
+Before deploying against live systems:
+1. Copy `.env.example` to `.env` and set `DEADMAN_MODE=real`, `TFY_API_KEY`,
+   `TFY_GATEWAY_BASE_URL`, `TFY_MCP_GATEWAY_URL`, and `DEADMAN_WEBHOOK_SECRET`.
+2. Set `DEADMAN_ENABLE_DEMO=0` for production. In real mode the default is disabled, but making
+   it explicit avoids operator ambiguity.
+3. Use `DEADMAN_STATE_BACKEND=dynamodb` for multi-replica production. The file backend is durable
+   across process death on one host, but not a distributed store.
+4. Run `make check`; then start the service and verify `GET /readyz` returns `{"ok": true, ...}`.
+5. Apply and tenant-validate `infra/ai_gateway.yaml` and `infra/guardrails.yaml` because hosted
+   gateway schemas can differ by TrueFoundry tenant/version.
 
 ### Exactly-once: the honest model
 The headline claim — *exactly-once across process death* — is enforced by three layers, not magic:

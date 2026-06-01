@@ -10,7 +10,7 @@ import deadman.state as state_module
 from deadman.state import DurableState, AuditLog
 from deadman.world import World
 from deadman.chaos import Chaos
-from deadman.commander import Deadman, REVERT_KEY
+from deadman.commander import Deadman, action_key
 from deadman.mcp_gateway import KillSignal
 
 
@@ -24,12 +24,13 @@ class TestResumeReconciliation:
 
         # Manually plant a PENDING record in durable state (simulates crash after
         # side-effect but before COMMIT write — the window that needs reconciliation).
+        revert_key = action_key(incident_id, "revert_pr", "PR-1337")
         ds = DurableState(incident_id)
-        ds.set_pending("github.revert_pr", REVERT_KEY)
+        ds.set_pending("github.revert_pr", revert_key)
 
         # The world shows the effect already happened (it did — before the crash).
         world = World()
-        world.revert_pr("PR-1337", REVERT_KEY)  # side effect already in system-of-record
+        world.revert_pr("PR-1337", revert_key)  # side effect already in system-of-record
 
         chaos = Chaos()  # no kill
         agent = Deadman(incident_id, world, chaos)
@@ -48,10 +49,11 @@ class TestResumeReconciliation:
         state_module.reset(incident_id)
 
         # Plant pending state + committed audit entry
+        revert_key = action_key(incident_id, "revert_pr", "PR-1337")
         ds = DurableState(incident_id)
-        ds.set_pending("github.revert_pr", REVERT_KEY)
+        ds.set_pending("github.revert_pr", revert_key)
         audit = AuditLog(incident_id)
-        audit.write({"status": "COMMITTED", "tool": "github.revert_pr", "key": REVERT_KEY})
+        audit.write({"status": "COMMITTED", "tool": "github.revert_pr", "key": revert_key})
 
         world = World()
         # world does NOT have the revert — simulates a different restart scenario

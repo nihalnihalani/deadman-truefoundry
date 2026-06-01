@@ -39,6 +39,7 @@ codebase never touches backend internals.
 from __future__ import annotations
 import json
 import os
+import tempfile
 import deadman.config as config
 
 
@@ -47,6 +48,7 @@ import deadman.config as config
 # ---------------------------------------------------------------------------
 
 def _file_path(incident_id: str, name: str) -> str:
+    incident_id = config.validate_incident_id(incident_id)
     os.makedirs(config.STATE_DIR, exist_ok=True)
     return os.path.join(config.STATE_DIR, f"{incident_id}.{name}")
 
@@ -69,7 +71,7 @@ class FileBackend:
     """Byte-compatible with the original state.py implementation."""
 
     def __init__(self, incident_id: str):
-        self.incident_id = incident_id
+        self.incident_id = config.validate_incident_id(incident_id)
         self._state_path = _file_path(incident_id, "state.json")
         self._audit_path = _file_path(incident_id, "audit.jsonl")
         self._lock_path = _file_path(incident_id, "lock")
@@ -83,14 +85,30 @@ class FileBackend:
         return _empty_state(self.incident_id)
 
     def save_state(self, data: dict):
-        with open(self._state_path, "w") as f:
-            json.dump(data, f, indent=2)
+        state_dir = os.path.dirname(self._state_path)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{self.incident_id}.",
+            suffix=".state.tmp",
+            dir=state_dir,
+            text=True,
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self._state_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     # ---- audit ----
 
     def append_audit(self, entry: dict):
         with open(self._audit_path, "a") as f:
             f.write(json.dumps(entry) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
     def read_audit(self) -> list[dict]:
         if not os.path.exists(self._audit_path):
@@ -166,7 +184,7 @@ class DynamoDBBackend:
         from botocore.exceptions import ClientError  # type: ignore  # noqa: F401
         self._ClientError = ClientError
 
-        self.incident_id = incident_id
+        self.incident_id = config.validate_incident_id(incident_id)
         self._table_name = config.DYNAMODB_TABLE
         self._dynamodb = boto3.resource("dynamodb", region_name=config.AWS_REGION)
         self._table = self._dynamodb.Table(self._table_name)
@@ -204,26 +222,27 @@ class DynamoDBBackend:
     # ---- audit ----
 
     def append_audit(self, entry: dict):
-        seq = self._next_seq()
-        sk = self._audit_sk(seq)
-        item = {
-            "PK": self.incident_id,
-            "SK": sk,
-            **{k: str(v) if not isinstance(v, str) else v for k, v in entry.items()},
-        }
-        # Conditional write: attribute_not_exists(PK) ensures each SK is written at most once.
-        # If a duplicate COMMITTED record arrives for the same SK, the condition fails and
-        # we swallow the ConditionalCheckFailedException — the record is already there.
-        try:
-            self._table.put_item(
-                Item=item,
-                ConditionExpression="attribute_not_exists(PK)",
-            )
-        except self._ClientError as exc:
-            if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                pass  # idempotent: already written
-            else:
+        for _ in range(5):
+            seq = self._next_seq()
+            sk = self._audit_sk(seq)
+            item = {
+                "PK": self.incident_id,
+                "SK": sk,
+                **{k: str(v) if not isinstance(v, str) else v for k, v in entry.items()},
+            }
+            # Conditional write: concurrent appenders may race on _next_seq(); retry
+            # with a fresh count instead of silently dropping an audit event.
+            try:
+                self._table.put_item(
+                    Item=item,
+                    ConditionExpression="attribute_not_exists(PK)",
+                )
+                return
+            except self._ClientError as exc:
+                if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                    continue
                 raise
+        raise RuntimeError(f"could not append audit record for incident {self.incident_id}")
 
     def read_audit(self) -> list[dict]:
         resp = self._table.query(
@@ -340,7 +359,7 @@ class DurableState:
     """
 
     def __init__(self, incident_id: str):
-        self.incident_id = incident_id
+        self.incident_id = config.validate_incident_id(incident_id)
         self._backend = _make_backend(incident_id)
         self.data = self._backend.load_state()
 
@@ -383,7 +402,7 @@ class AuditLog:
     """
 
     def __init__(self, incident_id: str):
-        self.incident_id = incident_id
+        self.incident_id = config.validate_incident_id(incident_id)
         self._backend = _make_backend(incident_id)
 
     def write(self, entry: dict):

@@ -27,7 +27,7 @@ from typing import AsyncGenerator
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -35,24 +35,11 @@ import deadman.config as config
 from deadman import state as _state_module
 from deadman.world import World, RealWorld
 from deadman.chaos import Chaos
-from deadman.commander import NaiveAgent, Deadman, REVERT_KEY
+from deadman.commander import NaiveAgent, Deadman, REVERT_KEY, action_key
 from deadman.mcp_gateway import KillSignal
 from deadman.state import AuditLog, DurableState
 
 logger = logging.getLogger("deadman.webhook")
-
-# ---------------------------------------------------------------------------
-# Security / feature flags (read directly from env — config.py is not ours).
-# ---------------------------------------------------------------------------
-# Optional shared secret. When set, POST /incident requires either:
-#   - Authorization: Bearer <secret>, OR
-#   - X-Deadman-Signature: <hex HMAC-SHA256 of the raw request body, keyed by secret>
-# When UNSET (mock/dev default) the endpoint is open so the demo + tests work.
-WEBHOOK_SECRET = os.getenv("DEADMAN_WEBHOOK_SECRET", "")
-
-# Demo/chaos endpoints are enabled by default ("1"); set "0" to disable them in
-# a real production deployment so they can't be hit there.
-DEMO_ENABLED = os.getenv("DEADMAN_ENABLE_DEMO", "1") != "0"
 
 # ---------------------------------------------------------------------------
 # App + CORS
@@ -92,21 +79,27 @@ async def _verify_webhook_auth(request: Request) -> None:
       * X-Deadman-Signature: <hex HMAC-SHA256(raw_body, secret)>  (PagerDuty/CloudWatch sign payloads)
     Raises HTTPException(401) on mismatch.
     """
-    if not WEBHOOK_SECRET:
+    secret = config.webhook_secret()
+    if not secret:
+        if config.is_real():
+            raise HTTPException(
+                status_code=503,
+                detail="DEADMAN_WEBHOOK_SECRET is required in real mode",
+            )
         return
 
     # 1) Bearer token (constant-time compare).
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer "):
         token = auth[len("Bearer "):]
-        if hmac.compare_digest(token, WEBHOOK_SECRET):
+        if hmac.compare_digest(token, secret):
             return
 
     # 2) HMAC signature over the raw body.
     sig = request.headers.get("x-deadman-signature", "")
     if sig:
         raw = await request.body()
-        expected = hmac.new(WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+        expected = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
         # tolerate an optional "sha256=" prefix some signers use
         provided = sig.split("=", 1)[1] if sig.startswith("sha256=") else sig
         if hmac.compare_digest(provided, expected):
@@ -117,8 +110,15 @@ async def _verify_webhook_auth(request: Request) -> None:
 
 def _require_demo_enabled() -> None:
     """Block demo/chaos endpoints when DEADMAN_ENABLE_DEMO=0 (production)."""
-    if not DEMO_ENABLED:
+    if not config.demo_enabled():
         raise HTTPException(status_code=404, detail="demo endpoints are disabled")
+
+
+def _validate_http_incident_id(incident_id: str) -> str:
+    try:
+        return config.validate_incident_id(incident_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 # ---------------------------------------------------------------------------
 # OTel init (no-op when OTEL not configured)
@@ -178,6 +178,7 @@ def _run_incident(incident_id: str) -> "Scoreboard":  # type: ignore[name-define
     (rehydrate + dedupe) rather than start a fresh run, so a re-delivered alert can never
     double-execute the in-flight destructive action.
     """
+    incident_id = config.validate_incident_id(incident_id)
     if config.is_real():
         world = RealWorld(audit_log=AuditLog(incident_id))
     else:
@@ -196,6 +197,12 @@ def healthz():
     return {"ok": True, "mode": config.MODE}
 
 
+@app.get("/readyz")
+def readyz():
+    status = config.readiness()
+    return JSONResponse(status_code=200 if status["ok"] else 503, content=status)
+
+
 # ---------------------------------------------------------------------------
 # /incident  (existing production webhook)
 # ---------------------------------------------------------------------------
@@ -203,6 +210,8 @@ def healthz():
 
 @app.post("/incident")
 async def handle_incident(inc: Incident, request: Request):
+    incident_id = _validate_http_incident_id(inc.incident_id)
+
     # Optional shared-secret auth (no-op when DEADMAN_WEBHOOK_SECRET is unset).
     await _verify_webhook_auth(request)
 
@@ -212,14 +221,14 @@ async def handle_incident(inc: Incident, request: Request):
     # requires a Deadman.run() signature change owned by Anchor, so we do NOT claim
     # it currently drives diagnosis.
     logger.info(
-        "incident received", extra={"incident_id": inc.incident_id, "summary": inc.summary}
+        "incident received", extra={"incident_id": incident_id, "summary": inc.summary}
     )
 
     # The agent's model/tool calls block (real-mode retries sleep up to a few
     # seconds); offload to a worker thread so the event loop stays responsive
     # during a 5xx storm. Mock-mode behaviour is identical.
-    sb = await run_in_threadpool(_run_incident, inc.incident_id)
-    return _scoreboard_dict(sb, inc.incident_id, summary=inc.summary)
+    sb = await run_in_threadpool(_run_incident, incident_id)
+    return _scoreboard_dict(sb, incident_id, summary=inc.summary)
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +238,7 @@ async def handle_incident(inc: Incident, request: Request):
 
 @app.get("/incident/{incident_id}/postmortem")
 def postmortem(incident_id: str):
+    incident_id = _validate_http_incident_id(incident_id)
     return {"incident_id": incident_id, "audit_trail": AuditLog(incident_id).postmortem()}
 
 
@@ -248,13 +258,14 @@ def _run_naive_demo() -> "Scoreboard":  # type: ignore[name-defined]
 
 def _run_deadman_demo() -> "Scoreboard":  # type: ignore[name-defined]
     incident_id = _DEMO_INCIDENT + "-" + uuid.uuid4().hex[:8]
+    revert_key = action_key(incident_id, "revert_pr", "PR-1337")
     _state_module.reset(incident_id)
     world = World()
     chaos = Chaos()
     chaos.correlated_blackout()
     chaos.rate_limit_storm()
     chaos.corrupt_output = True
-    chaos.kill_process_after(REVERT_KEY)
+    chaos.kill_process_after(revert_key)
 
     agent = Deadman(incident_id, world, chaos)
     try:

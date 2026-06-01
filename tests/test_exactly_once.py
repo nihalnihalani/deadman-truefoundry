@@ -8,7 +8,7 @@ import pytest
 import deadman.state as state_module
 from deadman.world import World
 from deadman.chaos import Chaos
-from deadman.commander import Deadman, REVERT_KEY
+from deadman.commander import Deadman, action_key
 from deadman.mcp_gateway import KillSignal
 
 
@@ -16,7 +16,7 @@ def _run_kill_then_resume(incident_id: str, world: World):
     """Run Deadman until kill, then resume fresh. Returns (first_agent, resumed_scoreboard)."""
     state_module.reset(incident_id)
     chaos = Chaos()
-    chaos.kill_process_after(REVERT_KEY)
+    chaos.kill_process_after(action_key(incident_id, "revert_pr", "PR-1337"))
 
     # First run: dies mid-rollback
     agent1 = Deadman(incident_id, world, chaos)
@@ -51,7 +51,7 @@ class TestExactlyOnce:
         incident_id = "test-kill-count"
         state_module.reset(incident_id)
         chaos = Chaos()
-        chaos.kill_process_after(REVERT_KEY)
+        chaos.kill_process_after(action_key(incident_id, "revert_pr", "PR-1337"))
 
         agent1 = Deadman(incident_id, world, chaos)
         with pytest.raises(KillSignal):
@@ -66,7 +66,7 @@ class TestExactlyOnce:
         incident_id = "test-property-resume"
         state_module.reset(incident_id)
         chaos = Chaos()
-        chaos.kill_process_after(REVERT_KEY)
+        chaos.kill_process_after(action_key(incident_id, "revert_pr", "PR-1337"))
 
         # Initial kill run
         agent1 = Deadman(incident_id, world, chaos)

@@ -1,5 +1,3 @@
-version: "3.9"
-
 # Run the app only:
 #   docker compose up deadman
 #
@@ -16,7 +14,8 @@ services:
     ports:
       - "8080:8080"
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
       # Override state backend to file when running standalone (no DynamoDB local needed).
       DEADMAN_STATE_BACKEND: ${DEADMAN_STATE_BACKEND:-file}
