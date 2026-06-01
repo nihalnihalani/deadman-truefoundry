@@ -317,16 +317,38 @@ class Deadman:
                 sb.notes.append(note)
                 continue
 
-            # ── IDEMPOTENCY KEY ───────────────────────────────────────────────
-            target = tools.idempotency_target(reg_tool, action.args)
-            key = action_key(self.incident_id, action.tool, target)
-
-            # Fast-path: already committed → tell the model, move on
-            if self.audit.is_committed(key):
-                note = f"[skipped-idempotent] {action.tool}({target}) already committed"
+            # ── VALIDATE MODEL-SUPPLIED ARGS ───────────────────────────────────
+            # LLMs routinely omit required args. Treat a validation failure exactly
+            # like a guardrail block: record it, do NOT execute, do NOT crash, and
+            # let the model choose again on the next turn.
+            try:
+                tools.validate_args(reg_tool, action.args)
+            except ValueError as e:
+                note = (
+                    f"[invalid-args] {action.tool}: {e} — choose again or pick another tool"
+                )
                 observations.append(note)
                 sb.notes.append(note)
                 continue
+
+            # ── IDEMPOTENCY KEY ───────────────────────────────────────────────
+            target = tools.idempotency_target(reg_tool, action.args)
+            if reg_tool.destructive:
+                # Destructive tools are exactly-once: key on the chosen action only,
+                # checkpoint BEFORE execute, dedup against the audit log.
+                key = action_key(self.incident_id, action.tool, target)
+                # Fast-path: already committed → tell the model, move on
+                if self.audit.is_committed(key):
+                    note = f"[skipped-idempotent] {action.tool}({target}) already committed"
+                    observations.append(note)
+                    sb.notes.append(note)
+                    continue
+            else:
+                # Non-destructive tools (diagnostics, statuspage) must NOT be
+                # idempotency-deduped — the model must be able to re-fetch fresh
+                # metrics/logs on every step. Make each call distinct via the loop
+                # step index so it always executes (never SKIPPED_IDEMPOTENT).
+                key = action_key(self.incident_id, action.tool, f"{target}#step{_step}")
 
             # ── PRE-EXECUTE: checkpoint destructive actions ────────────────────
             scope = self._scope()

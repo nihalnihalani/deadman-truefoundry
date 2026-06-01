@@ -282,25 +282,30 @@ def _scoreboard_dict(sb, incident_id: str | None = None, summary: str | None = N
     return d
 
 
-def _run_incident(incident_id: str) -> "Scoreboard":  # type: ignore[name-defined]
+def _run_incident(incident_id: str, summary: str = "") -> "Scoreboard":  # type: ignore[name-defined]
     """Blocking agent run, offloaded to a worker thread by the handler.
 
-    Real mode wires the production `RealWorld` system-of-record adapter (sharing the
-    incident's durable AuditLog), so the resume path reconciles against the LIVE provider
-    instead of an in-memory mock — this is what makes "exactly-once across process death"
-    true in the running server, not just in tests. Mock mode keeps the in-memory `World`.
+    REAL mode runs the genuine LLM-driven agentic loop (`run_agentic`): the model
+    diagnoses the incident (the alert `summary` is fed into its reasoning prompt) and
+    selects the mitigation tools itself. It uses the production `RealWorld` system-of-record
+    adapter (sharing the incident's durable AuditLog), so the resume path reconciles against
+    the LIVE provider — making "exactly-once across process death" true in the running
+    server, not just in tests.
 
-    The handler is resume-aware: if durable state already holds a pending (uncommitted)
-    action for this incident — i.e. a previous process crashed mid-mitigation — we resume
-    (rehydrate + dedupe) rather than start a fresh run, so a re-delivered alert can never
-    double-execute the in-flight destructive action.
+    MOCK mode runs the deterministic scripted scenario (`run`) so the offline demo + the
+    test suite stay reproducible.
+
+    Both paths are resume-aware: if durable state already holds a pending (uncommitted)
+    action — a previous process crashed mid-mitigation — we resume (rehydrate + dedupe)
+    rather than start fresh, so a re-delivered alert can never double-execute the in-flight
+    destructive action.
     """
     incident_id = config.validate_incident_id(incident_id)
+    resume = DurableState(incident_id).pending is not None
     if config.is_real():
         world = RealWorld(audit_log=AuditLog(incident_id))
-    else:
-        world = World()
-    resume = DurableState(incident_id).pending is not None
+        return Deadman(incident_id, world, chaos=None).run_agentic(summary, resume=resume)
+    world = World()
     return Deadman(incident_id, world, chaos=None).run(resume=resume)
 
 
@@ -350,7 +355,15 @@ def metrics_endpoint():
 
 @app.post("/incident")
 async def handle_incident(inc: Incident, request: Request):
-    # [RAMPART] Rate-limit by client host (IP or forwarded header).
+    # Validate the incident id, then authenticate BEFORE rate-limiting so an
+    # unauthenticated caller cannot drain a victim IP's token bucket (an authed
+    # request is the only one that should consume budget).
+    incident_id = _validate_http_incident_id(inc.incident_id)
+
+    # Optional shared-secret auth (no-op when DEADMAN_WEBHOOK_SECRET is unset).
+    await _verify_webhook_auth(request)
+
+    # [RAMPART] Rate-limit by client host (IP or forwarded header) — after auth.
     client_key = request.client.host if request.client else "unknown"
     if not _incident_limiter.allow(client_key):
         retry_after = _incident_limiter.retry_after(client_key)
@@ -360,16 +373,8 @@ async def handle_incident(inc: Incident, request: Request):
             headers={"Retry-After": str(max(1, int(retry_after) + 1))},
         )
 
-    incident_id = _validate_http_incident_id(inc.incident_id)
-
-    # Optional shared-secret auth (no-op when DEADMAN_WEBHOOK_SECRET is unset).
-    await _verify_webhook_auth(request)
-
-    # Structured log of the incoming alert summary so the alert text is recorded.
-    # NOTE: the summary is echoed back and logged here; full prompt-wiring (feeding
-    # the alert text into the commander's diagnosis prompt) is a follow-up — it
-    # requires a Deadman.run() signature change owned by Anchor, so we do NOT claim
-    # it currently drives diagnosis.
+    # In real mode the alert summary is fed into the agent's diagnosis prompt
+    # (deadman.commander.run_agentic); in mock mode the deterministic scenario runs.
     logger.info(
         "incident received", extra={"incident_id": incident_id, "summary": inc.summary}
     )
@@ -382,7 +387,7 @@ async def handle_incident(inc: Incident, request: Request):
         # The agent's model/tool calls block (real-mode retries sleep up to a few
         # seconds); offload to a worker thread so the event loop stays responsive
         # during a 5xx storm. Mock-mode behaviour is identical.
-        sb = await run_in_threadpool(_run_incident, incident_id)
+        sb = await run_in_threadpool(_run_incident, incident_id, inc.summary)
         return _scoreboard_dict(sb, incident_id, summary=inc.summary)
     finally:
         async with _in_flight_lock:

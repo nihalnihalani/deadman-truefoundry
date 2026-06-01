@@ -364,3 +364,82 @@ class TestLegacyRunUntouched:
 
         sb = NaiveAgent(world).run(chaos)
         assert sb.double_executions >= 1
+
+
+# ---------------------------------------------------------------------------
+# 9. P1-1 fix: model omits required args → no crash, no side effect, recovers
+# ---------------------------------------------------------------------------
+
+class TestAgenticInvalidArgs:
+    """A destructive tool with missing required args must NOT crash the loop nor
+    execute any side effect; a later valid turn must still succeed."""
+
+    def test_missing_required_args_does_not_crash(self, isolated_state):
+        incident_id = "test-agentic-invalid-args"
+        state_module.reset(incident_id)
+        world = World()
+        agent = Deadman(incident_id, world)
+
+        _patch_ai(agent, [
+            # Bad turn: github.revert_pr with no `pr` arg
+            '{"tool": "github.revert_pr", "args": {}, "rationale": "oops no pr", "done": false}',
+            # Recovery turn: valid revert
+            '{"tool": "github.revert_pr", "args": {"pr": "PR-88"}, "rationale": "now correct", "done": false}',
+            '{"done": true, "rationale": "resolved"}',
+        ])
+
+        # Must not raise (the bad turn would KeyError without the fix)
+        sb = agent.run_agentic("Incident", max_steps=8)
+
+        assert sb.survived is True
+        # Exactly one revert — the bad turn executed nothing, the valid turn ran once
+        assert world.count("revert_pr") == 1
+        assert any(r[1] == "PR-88" for r in world.applied if r[0] == "revert_pr")
+        # An invalid-args observation/note was recorded
+        assert any("invalid-args" in n for n in sb.notes)
+
+    def test_invalid_args_records_observation_and_no_side_effect_when_only_bad(self, isolated_state):
+        incident_id = "test-agentic-invalid-only"
+        state_module.reset(incident_id)
+        world = World()
+        agent = Deadman(incident_id, world)
+
+        _patch_ai(agent, [
+            # cordon_drain missing required `node`
+            '{"tool": "k8s.cordon_drain", "args": {}, "rationale": "drain something", "done": false}',
+            '{"done": true, "rationale": "giving up cleanly"}',
+        ])
+
+        sb = agent.run_agentic("Incident", max_steps=8)
+        assert sb.survived is True
+        assert world.count("cordon_drain") == 0
+        assert any("invalid-args" in n for n in sb.notes)
+
+
+# ---------------------------------------------------------------------------
+# 10. P2-3 fix: read tools re-fetch on every step (not idempotency-deduped)
+# ---------------------------------------------------------------------------
+
+class TestAgenticReadToolRefetch:
+    """A non-destructive diagnostic tool must execute on EVERY step, never SKIPPED."""
+
+    def test_read_tool_executes_on_two_separate_steps(self, isolated_state):
+        incident_id = "test-agentic-refetch"
+        state_module.reset(incident_id)
+        world = World()
+        agent = Deadman(incident_id, world)
+
+        _patch_ai(agent, [
+            '{"tool": "cw.get_metrics", "args": {}, "rationale": "fetch 1", "done": false}',
+            '{"tool": "cw.get_metrics", "args": {}, "rationale": "fetch 2", "done": false}',
+            '{"done": true, "rationale": "done"}',
+        ])
+
+        sb = agent.run_agentic("Incident", max_steps=8)
+        assert sb.survived is True
+
+        # Both metric fetches must have EXECUTED — neither skipped-idempotent.
+        executed = [n for n in sb.notes if n.startswith("[executed] cw.get_metrics")]
+        skipped = [n for n in sb.notes if n.startswith("[skipped-idempotent] cw.get_metrics")]
+        assert len(executed) == 2, f"Expected 2 executed reads, notes={sb.notes}"
+        assert len(skipped) == 0, f"Reads must not be deduped, notes={sb.notes}"
