@@ -1,0 +1,142 @@
+# 💀 DEADMAN — the agent that survives its own outage
+
+> **TrueFoundry "Resilient Agents" Hackathon** (with AWS Bedrock) · June 1–7, 2026
+> An autonomous **SRE / incident-commander** that keeps fighting a regional AWS outage **even when that same outage takes down its own model provider and tools.** The firefighter is standing in the fire — and TrueFoundry is the literal reason it's still alive at step 38.
+
+```
+>> DOUBLE-EXECUTIONS   NAIVE: 1              DEADMAN: 0
+```
+That one number is the whole pitch. **It already runs** — see [Quickstart](#-quickstart-runs-on-the-stdlib-no-setup).
+
+---
+
+## ⚡ Quickstart (runs on the stdlib, no setup)
+```bash
+git clone <this-repo> deadman-truefoundry && cd deadman-truefoundry
+
+# Day-1 crown jewel: kill the agent mid-rollback, resume, ASSERT exactly-once
+python scripts/prove_exactly_once.py
+
+# The split-screen chaos demo: naive agent vs DEADMAN + the Resilience Scoreboard
+python scripts/run_demo.py
+```
+No API keys, no install — the mock gateways + a file-backed durable store let the full
+**detect → fall back → guardrail → kill → resume exactly-once** loop run today. Set
+`DEADMAN_MODE=real` + `.env` to route through the real TrueFoundry AI Gateway + MCP Gateway + Bedrock.
+
+---
+
+## 🏆 Why this project will win — every reason
+
+### 1. It's the only idea whose failure domain *overlaps its workload*
+Most "resilient agent" submissions are a normal agent with `fallback: true` bolted on. DEADMAN is the rare case where **resilience IS the product**: an incident-commander is, by definition, running *during* the outage — so rate limits, provider death, tool failures, and bad intermediate outputs aren't injected gimmicks, they're the actual operating environment. *The thing fighting the fire is standing in the fire.* No other domain makes the theme this intrinsic.
+
+### 2. The judges ARE the user
+Judges are **Nikunj Bajaj (CEO, TrueFoundry)**, **Preethi Kumaresan (AWS)**, and a principal applied scientist. On-call SREs at an AWS shop during a regional event is *their* world — and it maps onto the **literal May 7–8, 2026 us-east-1 outage**. Maximum "Usefulness" + "Potential Impact" before a line of the pitch.
+
+### 3. It hits all 6 official criteria, deeply — scored 57/60
+| Criterion | Score | How DEADMAN nails it |
+|---|:--:|---|
+| **AI Gateway** | 10 | 5-tier Bedrock fallback: Claude **us-east-1 → us-west-2** (cross-region, the literal outage) → **Llama → Mistral → Cohere** (cross-provider) → **semantic cache "runbook brain."** Latency-shed *before* a hard 5xx. Every tier tagged in the trace. |
+| **MCP Gateway** | 10 | The audit log is load-bearing **three ways**: recovery ledger + **exactly-once dedup** + auto-postmortem. Cedar **default-DENY** on destructive verbs. |
+| **Guardrails** | 9 | **Pre-Tool** validates destructive args (rejects `scale-to-0` below the replica floor); **Post-Tool** catches corrupt/truncated tool output before the model reasons on it — the literal "bad intermediate output" cascade-breaker. |
+| **Resilience** | 10 | Append-only incident state machine **outside the provider** + idempotency-keyed actions → **rehydrate-and-dedupe on a kill mid-mitigation.** The rarest pattern (state loss on provider death), in the one domain where it's intrinsic. |
+| **Usefulness** | 9 | Real, high-stakes user; a mid-task crash = a **double-executed destructive rollback**. |
+| **Demo clarity** | 9 | A one-button "Correlated Blackout" cold open makes the thesis the first thing *seen*. |
+
+### 4. The most TrueFoundry-native idea in the bracket (the WOW the CEO is fishing for)
+**Authority degrades in lockstep with confidence.** DEADMAN couples the brand-new (May 27, 2026) **Agent Gateway** to the AI Gateway's fallback-depth signal: when the brain falls back to a weaker model, the Agent Gateway **automatically revokes the agent's `cordon_drain` / `revert_pr` authority** — a dumber brain gets a shorter leash, governed centrally, not in app code. You can watch `Drain authority` flip **ON → OFF** on the scoreboard. No other team will show this.
+
+### 5. The single, irrefutable WOW moment
+Kill the agent mid-rollback. The **naive agent restarts from step 1 and re-fires the destructive rollback (double-execution)**; DEADMAN reads its own audit log, sees the action already committed, **skips it**, and resumes. The scoreboard prints **Double-executions — NAIVE: 1 · DEADMAN: 0.** A single contrasting integer is more persuasive than any narration — and it proves state preservation + exactly-once + cross-Bedrock failover simultaneously.
+
+### 6. Deterministic demo = zero stage risk
+Every failure is a button; every recovery is reproducible. (We deliberately beat the flashier *voice* finalist precisely because a live sub-second voice failover can stutter once on camera and kill the thesis — DEADMAN's chaos never depends on network jitter at minute 3.)
+
+### 7. Bedrock depth the AWS judge will actually credit
+Cross-**region** (us-east-1→us-west-2) **and** cross-**provider** (Anthropic→Meta→Mistral→Cohere) failover, all on Bedrock, each hop visible in the trace. Not "I enabled fallbacks" — a real, tiered, observable failover story.
+
+### 8. Built-in path to the $1k "best social media" prize
+Two of the most screenshot-able artifacts in the whole hackathon: the *"we killed it at step 38 and it knew what it had already done"* clip, and the *"a dumber agent gets a shorter leash, automatically"* auto-leash clip. Daily build-in-public thread tagging @truefoundry.
+
+---
+
+## 🏗️ Architecture
+```
+ Incident webhook ─▶ DEADMAN COMMANDER (stateless worker; NO state held in-process)
+                          │
+        ┌─────────────────┼──────────────────────┐
+        ▼                 ▼                       ▼
+  TFY AI GATEWAY     TFY MCP GATEWAY          TFY AGENT GATEWAY (new, May 27)
+  fallback chain     scoped tools + Cedar     autonomy budget COUPLED to
+  latency-shed       default-DENY + Pre/Post  fallback-depth → revokes
+  semantic cache     guardrails + OTel audit  destructive authority on degrade
+        │                 │
+  Bedrock 5 tiers    External State Store (DynamoDB / file) + Audit Log
+                     = recovery ledger + exactly-once + postmortem
+```
+
+### Code map (this repo)
+| File | Role |
+|---|---|
+| `deadman/ai_gateway.py` | Mock **AI Gateway** — fallback chain, latency-shed, semantic-cache runbook brain, fallback-depth signal |
+| `deadman/mcp_gateway.py` | Mock **MCP Gateway + Guardrails** — Cedar default-deny, Pre/Post-Tool hooks, **idempotency = exactly-once**, audit |
+| `deadman/agent_gateway.py` | Mock **Agent Gateway** — autonomy budget; revokes destructive scope as the brain degrades |
+| `deadman/state.py` | **Durable state + append-only audit log** (file-backed → survives process death) — the crown jewel |
+| `deadman/world.py` | The prod environment / system of record (where double-execution is observable) |
+| `deadman/commander.py` | `NaiveAgent` vs `Deadman` (the resumable commander) |
+| `deadman/chaos.py` | The chaos injector — every failure is a toggle |
+| `scripts/prove_exactly_once.py` | **Day-1 gate:** kill mid-rollback, resume, assert exactly-once |
+| `scripts/run_demo.py` | The split-screen chaos demo + Resilience Scoreboard |
+
+### The Bedrock fallback chain (tag each tier in the trace)
+`Claude 3.5 Sonnet @ us-east-1` → `Claude 3.5 Sonnet @ us-west-2` → `Llama 3.1 70B` → `Mistral Large` → `Cohere Command R+` → `semantic cache`. Fallback on 429/500/502/503; **latency-shed when p99 breaches budget**.
+
+---
+
+## 🎬 The 4-minute chaos demo (build to this)
+Split-screen. LEFT = naive (raw Bedrock, in-process state). RIGHT = DEADMAN. Bottom = Resilience Scoreboard.
+
+| Time | Beat | Failure | LEFT | RIGHT |
+|---|---|---|---|---|
+| 0:00 | **Cold open — Correlated Blackout** | one "us-east-1 EVENT" button | starts dying in its own incident | *"the firefighter is in the fire"* — keeps commanding |
+| 0:30 | 429 storm + regional outage | us-east-1 down | stalls | latency-shed → us-west-2 |
+| 1:15 | All-Bedrock down | every live tier | dead | Llama→Mistral→Cohere→**cache**; **Agent Gateway revokes drain authority ON-SCREEN** |
+| 2:00 | Corrupt intermediate output | garbage JSON | reasons on garbage | **Post-Tool guardrail** catches it |
+| **2:45** | **🎯 KILL mid-rollback** | SIGKILL between side effect + commit | re-fires rollback → **DOUBLE** | reads its own audit log → **skips** → resumes |
+| 3:30 | Recovery + postmortem | restore | still dead | auto-writes postmortem from the audit log |
+
+---
+
+## 🚀 Real mode (TrueFoundry + Bedrock)
+1. Sign up for TrueFoundry; create an **AI Gateway** with the 5-tier Bedrock fallback (config as YAML, `tfy apply`).
+2. Register your tools behind the **MCP Gateway**; set Cedar/OPA default-deny on `k8s.cordon_drain`/`asg.scale`/`github.revert_pr`; turn on the OTel audit log.
+3. Add **Guardrails** (Pre-Tool arg validation, Post-Tool result inspection) via AI Gateway → Controls → Guardrails (WHEN/FROM/HOOKS).
+4. Wire the **Agent Gateway** autonomy budget to the AI Gateway fallback-depth signal.
+5. Swap the mock clients in `deadman/ai_gateway.py` / `deadman/mcp_gateway.py` for the real OpenAI-compatible TFY endpoint + Bedrock. `.env` keys are in `.env.example`.
+
+---
+
+## 🗓️ 7-Day Plan (June 1–7)
+| Day | Goal |
+|---|---|
+| Jun 1 | **De-risk the crown jewel** (this repo): external state machine + kill/resume → exactly-once. Start the X build-in-public thread. |
+| Jun 2 | Exactly-once via the MCP audit log. **Go/no-go: must hold today.** |
+| Jun 3 | AI Gateway depth: 5-tier fallback + latency-shed + semantic-cache runbook brain; verify trace tags. Post the kill-resume clip. |
+| Jun 4 | MCP scoping + guardrails (Cedar deny, Pre/Post hooks). |
+| Jun 5 | **Agent Gateway coupling (the WOW):** fallback-depth → auto-revoke authority. Post the auto-leash clip. |
+| Jun 6 | Chaos UI + split-screen scoreboard. |
+| Jun 7 | Rehearse ×5, record a deterministic take, final scoreboard tweet (tag @truefoundry), submit. |
+
+## ⚠️ Biggest risk → how to kill it
+**Risk:** it reads as "just a polished DevOps agent" and the meta-thesis doesn't land.
+- Front-load the thesis **visually** in the first 30 sec (the Correlated Blackout button + "the firefighter is in the fire").
+- Make **"Double-executions: 1 vs 0"** the one number on screen at the climax.
+- Reserve the **auto-leash** flip as the second WOW — it proves the TrueFoundry-native thesis no other team can claim.
+- **Secondary:** the Agent Gateway is brand-new (May 27) — treat the auto-leash coupling as a clean policy hook with a hand-rolled shim against the documented interface; never let an unfinished newest-product call block the deterministic core.
+
+## 🧰 Tech Stack
+AWS Bedrock (Claude/Llama/Mistral/Cohere) · TrueFoundry AI Gateway · TrueFoundry MCP Gateway + Guardrails · TrueFoundry Agent Gateway · Python.
+
+## 📄 License
+MIT — see [LICENSE](./LICENSE).

@@ -1,0 +1,8 @@
+# The mock demo runs on the Python stdlib — no install needed:
+#     python scripts/run_demo.py
+# Install these for real mode (TrueFoundry AI Gateway + MCP Gateway + Bedrock):
+boto3>=1.34
+openai>=1.30            # TrueFoundry AI Gateway is OpenAI-compatible
+fastapi>=0.110
+uvicorn>=0.29
+python-dotenv>=1.0
