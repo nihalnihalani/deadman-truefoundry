@@ -64,8 +64,8 @@ DEADMAN requires the following secrets. Create them in the TFY console
 ```bash
 # TrueFoundry AI Gateway
 tfy secret create --name deadman-tfy-api-key       --value "<TFY API key>"
-tfy secret create --name deadman-tfy-gateway-url   --value "https://<workspace>.truefoundry.cloud/api/llm/openai"
-tfy secret create --name deadman-mcp-gateway-url   --value "https://<workspace>.truefoundry.cloud/mcp"
+tfy secret create --name deadman-tfy-gateway-url   --value "https://gateway.truefoundry.ai"
+tfy secret create --name deadman-mcp-gateway-url   --value "https://gateway.truefoundry.ai/mcp/<mcp-server-name>/server"
 
 # Webhook security (generate a random 32-byte hex secret)
 tfy secret create --name deadman-webhook-secret    --value "$(openssl rand -hex 32)"
@@ -112,7 +112,7 @@ Verify the probes are green:
 
 ```bash
 # Replace <url> with the TFY-assigned ingress URL shown in the console
-curl https://<url>/healthz    # → {"status":"ok"}
+curl https://<url>/healthz    # → {"ok":true, ...}
 curl https://<url>/readyz     # → {"ok":true, ...}  (errors:[] means fully ready)
 ```
 
@@ -128,6 +128,7 @@ curl https://<url>/readyz     # → {"ok":true, ...}  (errors:[] means fully rea
 | `TFY_API_KEY` | yes (real mode) | — | TFY API key (secret) |
 | `TFY_GATEWAY_BASE_URL` | yes (real mode) | — | AI Gateway base URL (secret) |
 | `TFY_MCP_GATEWAY_URL` | yes (real mode) | — | MCP Gateway URL (secret) |
+| `TFY_MCP_TRANSPORT` | no | `auto` | `auto`, `mcp`, or `rest`; use `auto` for TFY MCP server URLs |
 | `TFY_RESILIENT_MODEL` | no | `deadman-resilient-bedrock` | Virtual model name |
 | `TFY_METADATA` | no | `app=deadman,role=incident-commander` | Gateway tracing tags |
 | `DEADMAN_WEBHOOK_SECRET` | yes (real mode) | — | HMAC-SHA256 signing secret |

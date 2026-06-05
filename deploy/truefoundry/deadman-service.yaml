@@ -140,6 +140,9 @@ env:
   - name: TFY_METADATA
     value: "app=deadman,role=incident-commander"
 
+  - name: TFY_MCP_TRANSPORT
+    value: "auto"                         # standard MCP for TFY server URLs, REST for local shims
+
   - name: AWS_REGION
     value: "us-east-1"
 

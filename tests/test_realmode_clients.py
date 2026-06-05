@@ -286,3 +286,75 @@ class TestRealmodeMCP:
             realmode_mcp.call_tool("asg.scale", {"replicas": 3}, "key-url")
             args, _ = mock_post.call_args
             assert args[0] == "https://mcp.example.com/tools/asg.scale"
+
+    def test_auto_transport_uses_rest_for_legacy_base_url(self, monkeypatch, isolated_state):
+        monkeypatch.setattr(config, "TFY_MCP_TRANSPORT", "auto")
+        monkeypatch.setattr(config, "TFY_MCP_GATEWAY_URL", "https://mcp.example.com/")
+
+        assert realmode_mcp.selected_transport() == "rest"
+
+    def test_auto_transport_uses_mcp_for_tfy_server_url(self, monkeypatch, isolated_state):
+        monkeypatch.setattr(config, "TFY_MCP_TRANSPORT", "auto")
+        monkeypatch.setattr(
+            config,
+            "TFY_MCP_GATEWAY_URL",
+            "https://gateway.truefoundry.ai/mcp/deadman/server",
+        )
+
+        assert realmode_mcp.selected_transport() == "mcp"
+
+    def test_forced_transport_overrides_url_heuristic(self, monkeypatch, isolated_state):
+        monkeypatch.setattr(config, "TFY_MCP_TRANSPORT", "rest")
+        monkeypatch.setattr(
+            config,
+            "TFY_MCP_GATEWAY_URL",
+            "https://gateway.truefoundry.ai/mcp/deadman/server",
+        )
+
+        assert realmode_mcp.selected_transport() == "rest"
+
+    def test_mcp_transport_call_tool_uses_standard_path(self, monkeypatch, isolated_state):
+        monkeypatch.setattr(config, "MODE", "real")
+        monkeypatch.setattr(config, "TFY_API_KEY", "key")
+        monkeypatch.setattr(config, "TFY_MCP_TRANSPORT", "mcp")
+        monkeypatch.setattr(
+            config,
+            "TFY_MCP_GATEWAY_URL",
+            "https://gateway.truefoundry.ai/mcp/deadman/server",
+        )
+        calls = []
+
+        async def _fake_call_once(tool, args, key):
+            calls.append((tool, args, key))
+            return {
+                "status_code": 200,
+                "body": {"result": "ok"},
+                "skipped_idempotent": False,
+            }
+
+        monkeypatch.setattr(realmode_mcp, "_call_tool_mcp_once", _fake_call_once)
+
+        result = realmode_mcp.call_tool("cw.get_metrics", {"window": "5m"}, "read-key")
+
+        assert result["body"] == {"result": "ok"}
+        assert calls == [("cw.get_metrics", {"window": "5m"}, "read-key")]
+
+    def test_mcp_transport_list_tools_normalizes_results(self, monkeypatch, isolated_state):
+        monkeypatch.setattr(config, "MODE", "real")
+        monkeypatch.setattr(config, "TFY_API_KEY", "key")
+        monkeypatch.setattr(config, "TFY_MCP_TRANSPORT", "mcp")
+        monkeypatch.setattr(
+            config,
+            "TFY_MCP_GATEWAY_URL",
+            "https://gateway.truefoundry.ai/mcp/deadman/server",
+        )
+
+        async def _fake_list_once():
+            return [{"name": "cw.get_metrics"}, {"name": "github.revert_pr"}]
+
+        monkeypatch.setattr(realmode_mcp, "_list_tools_mcp_once", _fake_list_once)
+
+        assert realmode_mcp.list_tools() == [
+            {"name": "cw.get_metrics"},
+            {"name": "github.revert_pr"},
+        ]
