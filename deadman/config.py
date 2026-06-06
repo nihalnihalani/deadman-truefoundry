@@ -11,6 +11,7 @@ The `model` field below is the FAMILY HINT used for that resolution and for trac
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from typing import Any
@@ -60,7 +61,20 @@ TFY_GATEWAY_BASE_URL = os.getenv("TFY_GATEWAY_BASE_URL", "")
 TFY_MCP_GATEWAY_URL = os.getenv("TFY_MCP_GATEWAY_URL", "")
 TFY_MCP_TRANSPORT = os.getenv("TFY_MCP_TRANSPORT", "auto")
 TFY_RESILIENT_MODEL = os.getenv("TFY_RESILIENT_MODEL", "deadman-resilient-bedrock")
-TFY_METADATA = os.getenv("TFY_METADATA", "app=deadman,role=incident-commander")
+def _parse_metadata(raw: str) -> str:
+    """Convert key=value,... or JSON string to a JSON object string for x-tfy-metadata."""
+    raw = raw.strip()
+    if raw.startswith("{"):
+        return raw
+    result = {}
+    for pair in raw.split(","):
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            result[k.strip()] = v.strip()
+    return json.dumps(result)
+
+
+TFY_METADATA = _parse_metadata(os.getenv("TFY_METADATA", "app=deadman,role=incident-commander"))
 
 # AWS / Bedrock — used by the live model-id resolver and (optionally) the DynamoDB state store.
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")

@@ -52,7 +52,7 @@ def selected_transport() -> str:
 
     parsed = urlparse(config.TFY_MCP_GATEWAY_URL)
     path = parsed.path.rstrip("/")
-    if "/mcp/" in path or path.endswith("/server"):
+    if "/mcp/" in path or path.endswith("/server") or path.endswith("/mcp"):
         return "mcp"
     return "rest"
 
