@@ -109,6 +109,7 @@ env:
   DEADMAN_DYNAMODB_TABLE: "deadman-incident-state"
   TFY_RESILIENT_MODEL: "deadman-resilient-bedrock"
   TFY_METADATA: "app=deadman,role=incident-commander"
+  TFY_MCP_TRANSPORT: "auto"
   AWS_REGION: "us-east-1"
   AWS_FALLBACK_REGION: "us-west-2"
   OTEL_SERVICE_NAME: "deadman-incident-commander"

@@ -125,17 +125,46 @@ Ready-to-edit configs ship in [`infra/`](./infra):
 2. **MCP Gateway + Guardrails** — `tfy apply -f infra/guardrails.yaml` sets Cedar default-deny on
    `k8s.cordon_drain`/`asg.scale`/`github.revert_pr`, the Pre/Post-Tool guardrails, the OTel audit
    log, and the **Agent Gateway** autonomy-budget coupling (revoke destructive scope at fallback depth 2).
-3. Set `DEADMAN_MODE=real` + the keys in `.env.example`. `deadman/ai_gateway.py` then calls the
+3. Copy `.env.example` to `.env`, set `DEADMAN_MODE=real`, and fill:
+   - `TFY_API_KEY`
+   - `TFY_GATEWAY_BASE_URL` from **AI Gateway → Playground → Code** (OpenAI-compatible base URL)
+   - `TFY_MCP_GATEWAY_URL` from **MCP Gateway → your server → Connect** (usually
+     `https://gateway.truefoundry.ai/mcp/<server>/server`)
+   - `DEADMAN_WEBHOOK_SECRET`
+   `deadman/ai_gateway.py` then calls the
    OpenAI-compatible gateway via `deadman/realmode_ai.py` (it reads the `x-tfy-*` response headers
    to recover the fallback depth that drives the auto-leash); tools route through
-   `deadman/realmode_mcp.py` → the MCP Gateway with an `Idempotency-Key` header.
-4. Run the webhook a PagerDuty/CloudWatch alarm hits: `uvicorn deadman.webhook:app --port 8080`.
+   `deadman/realmode_mcp.py` → the MCP Gateway with an `Idempotency-Key` header. `TFY_MCP_TRANSPORT=auto`
+   selects the standard MCP transport for the TrueFoundry server URL and keeps a REST shim for local tests.
+4. Run the safe live wiring check. It performs one small model call and lists MCP tools, but never
+   invokes destructive tools:
+   `python scripts/real_doctor.py`
+5. Run the webhook a PagerDuty/CloudWatch alarm hits: `uvicorn deadman.webhook:app --port 8080`.
    Set `DEADMAN_WEBHOOK_SECRET` to require a bearer token / HMAC signature on `/incident`, and
    leave `DEADMAN_ENABLE_DEMO` unset (or set it to `0`) so demo + chaos endpoints stay disabled
    in real mode. Check `/readyz` before routing real alerts; it returns 503 until required real
    mode config is present and unsafe demo/auth settings are closed.
 
 The mock and real paths share the same agent logic — only the gateway clients swap.
+
+### If you do not have an MCP server yet
+
+Use the safe demo server in [`mcp_servers/deadman_safe_tools.py`](./mcp_servers/deadman_safe_tools.py)
+to get real TrueFoundry MCP Gateway auth/audit/tool routing without touching production systems.
+In the TrueFoundry **Add new MCP Server** screen, choose **Create a Hosted STDIO-based MCP Server**
+for the hackathon/demo path and configure:
+
+| Field | Value |
+|---|---|
+| Name | `deadman-tools` |
+| Command | `python` |
+| Args | `mcp_servers/deadman_safe_tools.py` |
+| Auth | No auth / gateway-auth only |
+
+After it is created, open the server's **How To Use** / **Connect** tab and copy the URL that looks
+like `https://gateway.truefoundry.ai/mcp/deadman-tools/server`. Put that in `.env` as
+`TFY_MCP_GATEWAY_URL`. For production, replace this safe stub with official/remote MCP servers for
+GitHub, Kubernetes, CloudWatch, ASG, and Statuspage, with least-privilege auth.
 
 ### Production readiness checklist
 
@@ -146,7 +175,8 @@ Before deploying against live systems:
    it explicit avoids operator ambiguity.
 3. Use `DEADMAN_STATE_BACKEND=dynamodb` for multi-replica production. The file backend is durable
    across process death on one host, but not a distributed store.
-4. Run `make check`; then start the service and verify `GET /readyz` returns `{"ok": true, ...}`.
+4. Run `make check` locally, then `make real-doctor` with real credentials. Start the service and
+   verify `GET /readyz` returns `{"ok": true, ...}`.
 5. Apply and tenant-validate `infra/ai_gateway.yaml` and `infra/guardrails.yaml` because hosted
    gateway schemas can differ by TrueFoundry tenant/version.
 

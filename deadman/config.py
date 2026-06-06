@@ -58,6 +58,7 @@ STATE_DIR = os.getenv("DEADMAN_STATE_DIR", ".deadman_state")
 TFY_API_KEY = os.getenv("TFY_API_KEY", "")
 TFY_GATEWAY_BASE_URL = os.getenv("TFY_GATEWAY_BASE_URL", "")
 TFY_MCP_GATEWAY_URL = os.getenv("TFY_MCP_GATEWAY_URL", "")
+TFY_MCP_TRANSPORT = os.getenv("TFY_MCP_TRANSPORT", "auto")
 TFY_RESILIENT_MODEL = os.getenv("TFY_RESILIENT_MODEL", "deadman-resilient-bedrock")
 TFY_METADATA = os.getenv("TFY_METADATA", "app=deadman,role=incident-commander")
 
@@ -138,6 +139,13 @@ def production_issues() -> list[dict[str, Any]]:
             "severity": "error",
             "field": "DEADMAN_STATE_BACKEND",
             "message": "must be either 'file' or 'dynamodb'",
+        })
+
+    if TFY_MCP_TRANSPORT not in {"auto", "mcp", "rest"}:
+        issues.append({
+            "severity": "error",
+            "field": "TFY_MCP_TRANSPORT",
+            "message": "must be one of 'auto', 'mcp', or 'rest'",
         })
 
     if STATE_BACKEND == "dynamodb" and not DYNAMODB_TABLE:
