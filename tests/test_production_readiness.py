@@ -67,6 +67,17 @@ class TestReadiness:
         assert data["demo_enabled"] is False
         assert any(issue["field"] == "DEADMAN_STATE_BACKEND" for issue in data["warnings"])
 
+    def test_readyz_rejects_invalid_mcp_transport(self, isolated_state, monkeypatch):
+        _set_real_gateway_config(monkeypatch)
+        monkeypatch.setattr(config, "TFY_MCP_TRANSPORT", "bogus")
+        monkeypatch.setenv("DEADMAN_WEBHOOK_SECRET", "secret")
+
+        resp = client.get("/readyz")
+
+        assert resp.status_code == 503
+        fields = {issue["field"] for issue in resp.json()["errors"]}
+        assert "TFY_MCP_TRANSPORT" in fields
+
 
 class TestFailClosedHttp:
 

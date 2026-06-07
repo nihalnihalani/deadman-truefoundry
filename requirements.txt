@@ -15,6 +15,9 @@ sse-starlette>=1.6
 # HTTP client (real-mode MCP calls + healthcheck)
 requests>=2.31
 
+# Standard MCP client transport for TrueFoundry MCP Gateway URLs copied from the UI
+fastmcp>=3.4.1
+
 # Real-mode AI Gateway (OpenAI-compatible TFY endpoint)
 openai>=1.30
 

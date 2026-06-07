@@ -104,17 +104,51 @@ Two of the most screenshot-able artifacts in the whole hackathon: the *"we kille
 
 ---
 
-## 🎬 The 4-minute chaos demo (build to this)
-Split-screen. LEFT = naive (raw Bedrock, in-process state). RIGHT = DEADMAN. Bottom = Resilience Scoreboard.
+## 🎬 The 3-minute judge demo — "The Fire That Fights Itself"
 
-| Time | Beat | Failure | LEFT | RIGHT |
+### Setup (before presenting)
+```bash
+# Terminal 1 — MCP server (keep running)
+.venv/bin/python mcp_servers/deadman_safe_tools.py --transport http --port 8000
+
+# Terminal 2 — web server
+DEADMAN_MODE=mock DEADMAN_ENABLE_DEMO=1 .venv/bin/uvicorn deadman.webhook:app --port 8080
+```
+Open `http://localhost:8080` in the browser.
+
+### [0:00 — The Problem, 20 sec]
+> *"It's 3am. Your checkout service is down. You've deployed an AI agent to handle it — it detects the bad deploy, starts the rollback. Then it crashes. It restarts. It sees the bad deploy again. It runs the rollback again. A PR gets reverted twice. Nodes get drained twice. Your fix becomes the outage. That's the problem DEADMAN solves."*
+
+### [0:20 — The Proof, 60 sec]
+```bash
+python scripts/run_demo.py
+```
+> *"NAIVE hits the outage, loses state, double-executes the rollback — double-executions = **1**. DEADMAN rehydrates from its audit log, sees the rollback already ran, skips it — double-executions = **0**."*
+
+```bash
+python scripts/prove_exactly_once.py
+```
+> *"SIGKILL mid-rollback. Fresh process. Audit log says it already happened. [PASS] — exactly once, across process death."*
+
+### [1:20 — Live War Room, 80 sec]
+Click chaos toggles: **☠ Correlated Blackout** → **⚡ 429 Storm** → **☠ All-Bedrock-Down** → **🔴 KILL mid-rollback**, then hit **RUN**.
+> *"Naive: 1. DEADMAN: 0. The agent that was fighting the fire just became the fire — DEADMAN didn't."*
+
+### [2:40 — Real Stack, 20 sec]
+```bash
+python scripts/real_doctor.py
+```
+> *"This runs on TrueFoundry right now. AI Gateway for model resilience. MCP Gateway for governed tool execution with audit trail. All green."*
+
+### Beat table (for reference)
+| Time | Beat | Failure | Naive | DEADMAN |
 |---|---|---|---|---|
-| 0:00 | **Cold open — Correlated Blackout** | one "us-east-1 EVENT" button | starts dying in its own incident | *"the firefighter is in the fire"* — keeps commanding |
+| 0:00 | **Correlated Blackout** | us-east-1 EVENT | starts dying | keeps commanding |
 | 0:30 | 429 storm + regional outage | us-east-1 down | stalls | latency-shed → us-west-2 |
-| 1:15 | All-Bedrock down | every live tier | dead | Llama→Mistral→Cohere→**cache**; **Agent Gateway revokes drain authority ON-SCREEN** |
+| 1:15 | All-Bedrock down | every live tier | dead | Llama→Mistral→Cohere→**cache**; drain authority revoked |
 | 2:00 | Corrupt intermediate output | garbage JSON | reasons on garbage | **Post-Tool guardrail** catches it |
-| **2:45** | **🎯 KILL mid-rollback** | SIGKILL between side effect + commit | re-fires rollback → **DOUBLE** | reads its own audit log → **skips** → resumes |
-| 3:30 | Recovery + postmortem | restore | still dead | auto-writes postmortem from the audit log |
+| **2:45** | **🎯 KILL mid-rollback** | SIGKILL mid-action | re-fires → **DOUBLE** | reads audit log → **skips** → resumes |
+| 3:30 | Recovery + postmortem | restore | still dead | auto-writes postmortem |
 
 ---
 
@@ -125,17 +159,57 @@ Ready-to-edit configs ship in [`infra/`](./infra):
 2. **MCP Gateway + Guardrails** — `tfy apply -f infra/guardrails.yaml` sets Cedar default-deny on
    `k8s.cordon_drain`/`asg.scale`/`github.revert_pr`, the Pre/Post-Tool guardrails, the OTel audit
    log, and the **Agent Gateway** autonomy-budget coupling (revoke destructive scope at fallback depth 2).
-3. Set `DEADMAN_MODE=real` + the keys in `.env.example`. `deadman/ai_gateway.py` then calls the
+3. Copy `.env.example` to `.env`, set `DEADMAN_MODE=real`, and fill:
+   - `TFY_API_KEY` — your TrueFoundry Personal Access Token
+   - `TFY_GATEWAY_BASE_URL` — from **AI Gateway → Playground → Code** (e.g. `https://gateway.truefoundry.ai`)
+   - `TFY_MCP_GATEWAY_URL` — from **MCP Gateway → your server → Connect** (e.g. `https://gateway.truefoundry.ai/sam/mcp/deadman-tools/server`); for local testing use `http://127.0.0.1:8000/mcp`
+   - `TFY_RESILIENT_MODEL` — the model ID from **AI Gateway → `</>` code snippet** (e.g. `anthropic/claude-sonnet-4-6`)
+   - `DEADMAN_WEBHOOK_SECRET`
+   `deadman/ai_gateway.py` then calls the
    OpenAI-compatible gateway via `deadman/realmode_ai.py` (it reads the `x-tfy-*` response headers
    to recover the fallback depth that drives the auto-leash); tools route through
-   `deadman/realmode_mcp.py` → the MCP Gateway with an `Idempotency-Key` header.
-4. Run the webhook a PagerDuty/CloudWatch alarm hits: `uvicorn deadman.webhook:app --port 8080`.
+   `deadman/realmode_mcp.py` → the MCP Gateway with an `Idempotency-Key` header. `TFY_MCP_TRANSPORT=auto`
+   selects the standard MCP transport for the TrueFoundry server URL and keeps a REST shim for local tests.
+4. Run the safe live wiring check. It performs one small model call and lists MCP tools, but never
+   invokes destructive tools:
+   `python scripts/real_doctor.py`
+5. Run the webhook a PagerDuty/CloudWatch alarm hits: `uvicorn deadman.webhook:app --port 8080`.
    Set `DEADMAN_WEBHOOK_SECRET` to require a bearer token / HMAC signature on `/incident`, and
    leave `DEADMAN_ENABLE_DEMO` unset (or set it to `0`) so demo + chaos endpoints stay disabled
    in real mode. Check `/readyz` before routing real alerts; it returns 503 until required real
    mode config is present and unsafe demo/auth settings are closed.
 
 The mock and real paths share the same agent logic — only the gateway clients swap.
+
+### If you do not have an MCP server yet
+
+Use the safe demo server in [`mcp_servers/deadman_safe_tools.py`](./mcp_servers/deadman_safe_tools.py)
+to get real TrueFoundry MCP Gateway auth/audit/tool routing without touching production systems.
+In the TrueFoundry **Add new MCP Server** screen, choose **Create a Hosted STDIO-based MCP Server**
+for the hackathon/demo path and configure:
+
+Paste this JSON in the **STDIO Configuration** editor:
+
+```json
+{
+  "mcpServers": {
+    "deadman-tools": {
+      "command": "python",
+      "args": ["mcp_servers/deadman_safe_tools.py"],
+      "env": {}
+    }
+  }
+}
+```
+
+Click **Import Manifest**, then **Next**. After it is created, open the server's **How To Use** / **Connect** tab and copy the URL (e.g. `https://gateway.truefoundry.ai/sam/mcp/deadman-tools/server`). Put that in `.env` as `TFY_MCP_GATEWAY_URL`.
+
+**Local alternative** — run the safe server as an HTTP endpoint instead of using TrueFoundry hosting:
+```bash
+.venv/bin/python mcp_servers/deadman_safe_tools.py --transport http --host 127.0.0.1 --port 8000
+# Then set: TFY_MCP_GATEWAY_URL=http://127.0.0.1:8000/mcp
+``` For production, replace this safe stub with official/remote MCP servers for
+GitHub, Kubernetes, CloudWatch, ASG, and Statuspage, with least-privilege auth.
 
 ### Production readiness checklist
 
@@ -146,7 +220,8 @@ Before deploying against live systems:
    it explicit avoids operator ambiguity.
 3. Use `DEADMAN_STATE_BACKEND=dynamodb` for multi-replica production. The file backend is durable
    across process death on one host, but not a distributed store.
-4. Run `make check`; then start the service and verify `GET /readyz` returns `{"ok": true, ...}`.
+4. Run `make check` locally, then `make real-doctor` with real credentials. Start the service and
+   verify `GET /readyz` returns `{"ok": true, ...}`.
 5. Apply and tenant-validate `infra/ai_gateway.yaml` and `infra/guardrails.yaml` because hosted
    gateway schemas can differ by TrueFoundry tenant/version.
 

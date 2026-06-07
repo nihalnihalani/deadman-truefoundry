@@ -1,4 +1,4 @@
-.PHONY: demo prove web serve test check compose-check docker-build docker-up ui
+.PHONY: demo prove real-doctor web serve test check compose-check docker-build docker-up ui
 
 # ── Demo / proof targets ────────────────────────────────────────────────────
 
@@ -7,6 +7,9 @@ demo:   ## Split-screen chaos demo: naive vs DEADMAN (stdlib, no setup)
 
 prove:  ## Day-1 crown jewel: kill mid-rollback, resume, assert exactly-once
 	python3 scripts/prove_exactly_once.py
+
+real-doctor:  ## Safe live wiring check: config + AI Gateway ping + MCP tool listing
+	python3 scripts/real_doctor.py
 
 # ── Server targets ──────────────────────────────────────────────────────────
 
