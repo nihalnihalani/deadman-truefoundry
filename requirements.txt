@@ -22,7 +22,7 @@ fastmcp>=3.4.1
 fastmcp>=3.4.1
 
 # Real-mode AI Gateway (OpenAI-compatible TFY endpoint)
-openai>=1.30
+openai>=2.41.0
 
 # Real-mode + DynamoDB state backend
 boto3>=1.43.18
