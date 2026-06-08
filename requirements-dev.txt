@@ -22,4 +22,4 @@ bandit>=1.7.8
 pre-commit>=3.7.0
 
 # Integration testing — DynamoDB in-memory mock (used by test_dynamodb_integration.py)
-moto[dynamodb]>=5.0.0
+moto[dynamodb]>=5.2.2
