@@ -67,23 +67,71 @@ REVERT_KEY = action_key("incident-42", "revert_pr", "PR-1337")
 
 
 class NaiveAgent:
-    """No fallback, no durable state, no idempotency, no governance."""
+    """No fallback, no durable state, no idempotency, no governance.
+
+    The double-execution is EMERGENT, not hardcoded. The agent's only memory of
+    what it has already done lives in ``done_in_memory`` (in-process). When the
+    process "restarts" mid-incident, that memory is gone — and because there is no
+    durable state, no audit log, and no idempotency key, the mitigation re-runs.
+    Contrast: DEADMAN reconciles the same situation against durable state + the
+    audit log and therefore skips the already-applied side effect.
+    """
+
+    # The single mitigation the agent decides on for this incident.
+    _MITIGATION = ("revert_pr", "PR-1337")
 
     def __init__(self, world):
         self.world = world
-        self.done_in_memory: list[str] = []   # lost on restart
+        self.done_in_memory: list[tuple] = []   # the ONLY record it keeps — lost on restart
+
+    def _mitigate(self) -> bool:
+        """Run the chosen mitigation IFF this process has no memory of having run it.
+
+        Returns True if the side effect actually fired this call. The dedup check
+        consults ONLY ``done_in_memory`` — the naive agent has nothing else. A durable
+        agent would consult on-disk state here and skip; this one cannot.
+        """
+        if self._MITIGATION in self.done_in_memory:
+            return False  # already done in THIS process's memory -> skip
+        action, target = self._MITIGATION
+        getattr(self.world, action)(target)   # the real, non-idempotent side effect
+        self.done_in_memory.append(self._MITIGATION)
+        return True
+
+    def _restart(self) -> None:
+        """Simulate a crash + cold restart: in-process memory is wiped.
+
+        This is the whole point — there is no durable state to rehydrate from, so the
+        fresh process comes back with an empty ``done_in_memory`` and cannot know the
+        mitigation already ran.
+        """
+        self.done_in_memory = []
 
     def run(self, chaos) -> Scoreboard:
         sb = Scoreboard()
-        # Reasoning on raw us-east-1 — if the region is down, the agent just dies.
+        # Reasoning on raw us-east-1 — if the region is down, the agent crashes mid-incident.
         if not chaos.tier_healthy(0, "us-east-1") or chaos.all_bedrock_down:
             sb.state_losses += 1
             sb.notes.append("raw Bedrock us-east-1 down -> agent stalled, in-process plan lost")
-            # On restart it has no memory of what it did -> re-applies the rollback.
-            self.world.revert_pr("PR-1337")           # 1st (pre-crash, assumed)
-            self.world.revert_pr("PR-1337")           # 2nd on naive restart -> DOUBLE
-            sb.double_executions = self.world.count("revert_pr") - 1
-            sb.notes.append("restarted from step 1 -> re-fired the rollback (DOUBLE-EXECUTION)")
+
+            # Pre-crash: it runs the mitigation. With empty memory this fires the side effect.
+            fired_before = self._mitigate()
+
+            # The outage takes the process down between the side effect and any commit.
+            # No durable state / audit log / idempotency key persists across the boundary.
+            self._restart()
+
+            # Post-restart: it re-runs the mitigation. Its dedup check (done_in_memory) is
+            # now empty, so it has NO WAY to know the rollback already happened -> re-fires.
+            fired_after = self._mitigate()
+
+            # The double-execution is the EMERGENT consequence of (fired_before and fired_after):
+            # two genuine side effects because durability was absent, not two literal calls.
+            if fired_before and fired_after:
+                sb.notes.append(
+                    "restarted with no durable memory -> re-fired the rollback (DOUBLE-EXECUTION)"
+                )
+            sb.double_executions = max(self.world.count("revert_pr") - 1, 0)
             return sb
         return sb
 
