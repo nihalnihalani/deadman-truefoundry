@@ -1,4 +1,4 @@
-.PHONY: demo prove real-doctor web serve test check compose-check docker-build docker-up ui
+.PHONY: demo prove prove-kill demo-failover real-doctor web serve test check compose-check docker-build docker-up ui
 
 # ── Demo / proof targets ────────────────────────────────────────────────────
 
@@ -7,6 +7,12 @@ demo:   ## Split-screen chaos demo: naive vs DEADMAN (stdlib, no setup)
 
 prove:  ## Day-1 crown jewel: kill mid-rollback, resume, assert exactly-once
 	python3 scripts/prove_exactly_once.py
+
+prove-kill:  ## Exactly-once across a REAL OS process kill (two distinct PIDs)
+	python3 scripts/prove_exactly_once_subprocess.py
+
+demo-failover:  ## LIVE AWS Bedrock cross-provider failover (real Converse calls)
+	python3 scripts/bedrock_failover_demo.py --down 2
 
 real-doctor:  ## Safe live wiring check: config + AI Gateway ping + MCP tool listing
 	python3 scripts/real_doctor.py
