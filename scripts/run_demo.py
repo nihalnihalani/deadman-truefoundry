@@ -6,6 +6,10 @@ Injects the challenge's failures and prints the Resilience Scoreboard. The headl
 NAIVE double-executes a destructive rollback; DEADMAN does it exactly once.
 """
 import os
+# Force mock mode BEFORE importing deadman.* so this demo never needs credentials.
+# config.py auto-loads .env via python-dotenv, which does NOT override an env var that
+# is already set — so setting it here wins even when a repo-root .env says MODE=real.
+os.environ["DEADMAN_MODE"] = "mock"
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

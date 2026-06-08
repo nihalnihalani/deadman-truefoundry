@@ -24,8 +24,19 @@ python scripts/run_demo.py
 make check
 ```
 No API keys, no install — the mock gateways + a file-backed durable store let the full
-**detect → fall back → guardrail → kill → resume exactly-once** loop run today. Set
-`DEADMAN_MODE=real` + `.env` to route through the real TrueFoundry AI Gateway + MCP Gateway + Bedrock.
+**detect → fall back → guardrail → kill → resume exactly-once** loop run today. Both mock
+demos above force `DEADMAN_MODE=mock` at the top of the script (it wins over any `.env`), so
+they need no credentials and run green regardless of your real-mode config.
+
+**Live-Bedrock proof (evidence the real path works).** With AWS creds configured:
+```bash
+DEADMAN_LLM_BACKEND=bedrock python3 scripts/real_doctor.py --skip-mcp --skip-dynamodb
+# -> [PASS] Bedrock completion (direct) - served_by=claude-sonnet-4-6@us-east-1
+```
+And `python3 scripts/bedrock_failover_demo.py --down 2` drives a live cross-provider failover
+(take down N tiers, watch it shed to the next invocable Bedrock model).
+
+Set `DEADMAN_MODE=real` + `.env` to route through the real TrueFoundry AI Gateway + MCP Gateway + Bedrock.
 
 ---
 
@@ -37,10 +48,11 @@ Most "resilient agent" submissions are a normal agent with `fallback: true` bolt
 ### 2. The judges ARE the user
 Judges are **Nikunj Bajaj (CEO, TrueFoundry)**, **Preethi Kumaresan (AWS)**, and a principal applied scientist. On-call SREs at an AWS shop during a regional event is *their* world — and it maps onto the **literal May 7–8, 2026 us-east-1 outage**. Maximum "Usefulness" + "Potential Impact" before a line of the pitch.
 
-### 3. It hits all 6 official criteria, deeply — scored 57/60
-| Criterion | Score | How DEADMAN nails it |
+### 3. It hits all 6 official criteria, deeply
+*Scores below are our own self-assessment against the published rubric, not a judged result.*
+| Criterion | Self-score | How DEADMAN nails it |
 |---|:--:|---|
-| **AI Gateway** | 10 | 5-tier Bedrock fallback: Claude **us-east-1 → us-west-2** (cross-region, the literal outage) → **Llama → Mistral → Cohere** (cross-provider) → **semantic cache "runbook brain."** Latency-shed *before* a hard 5xx. Every tier tagged in the trace. |
+| **AI Gateway** | 10 | 5-tier Bedrock fallback design: Claude **us-east-1 → us-west-2** (cross-region, the literal outage) → **Llama → Mistral → Cohere** (cross-provider) → **semantic cache "runbook brain."** Latency-shed *before* a hard 5xx; every tier tagged in the trace. The opus-led chain is the aspirational design (see note under §7); the live-invocable chain that runs today is **claude-sonnet-4-6 → claude-haiku-4-5 → llama3-3-70b → nova-2-lite**. |
 | **MCP Gateway** | 10 | The audit log is load-bearing **three ways**: recovery ledger + **exactly-once dedup** + auto-postmortem. Cedar **default-DENY** on destructive verbs. |
 | **Guardrails** | 9 | **Pre-Tool** validates destructive args (rejects `scale-to-0` below the replica floor); **Post-Tool** catches corrupt/truncated tool output before the model reasons on it — the literal "bad intermediate output" cascade-breaker. |
 | **Resilience** | 10 | Append-only incident state machine **outside the provider** + idempotency-keyed actions → **rehydrate-and-dedupe on a kill mid-mitigation.** The rarest pattern (state loss on provider death), in the one domain where it's intrinsic. |
@@ -48,13 +60,13 @@ Judges are **Nikunj Bajaj (CEO, TrueFoundry)**, **Preethi Kumaresan (AWS)**, and
 | **Demo clarity** | 9 | A one-button "Correlated Blackout" cold open makes the thesis the first thing *seen*. |
 
 ### 4. The most TrueFoundry-native idea in the bracket (the WOW the CEO is fishing for)
-**Authority degrades in lockstep with confidence.** DEADMAN couples the brand-new (May 27, 2026) **Agent Gateway** to the AI Gateway's fallback-depth signal: when the brain falls back to a weaker model, the Agent Gateway **automatically revokes the agent's `cordon_drain` / `revert_pr` authority** — a dumber brain gets a shorter leash, governed centrally, not in app code. You can watch `Drain authority` flip **ON → OFF** on the scoreboard. No other team will show this.
+**Authority degrades in lockstep with confidence.** DEADMAN couples the brand-new (May 27, 2026) **Agent Gateway** pattern to the AI Gateway's fallback-depth signal: when the brain falls back to a weaker model, the auto-leash **automatically revokes the agent's `cordon_drain` / `revert_pr` authority** — a dumber brain gets a shorter leash. Today this runs as an in-process policy shim (`deadman/agent_gateway.py`) that mirrors the TrueFoundry Agent Gateway pattern against its documented interface, so the same policy can move to the hosted Agent Gateway unchanged. You can watch `Drain authority` flip **ON → OFF** on the scoreboard.
 
 ### 5. The single, irrefutable WOW moment
 Kill the agent mid-rollback. The **naive agent restarts from step 1 and re-fires the destructive rollback (double-execution)**; DEADMAN reads its own audit log, sees the action already committed, **skips it**, and resumes. The scoreboard prints **Double-executions — NAIVE: 1 · DEADMAN: 0.** A single contrasting integer is more persuasive than any narration — and it proves state preservation + exactly-once + cross-Bedrock failover simultaneously.
 
 ### 6. Deterministic demo = zero stage risk
-Every failure is a button; every recovery is reproducible. (We deliberately beat the flashier *voice* finalist precisely because a live sub-second voice failover can stutter once on camera and kill the thesis — DEADMAN's chaos never depends on network jitter at minute 3.)
+Every failure is a button; every recovery is reproducible. DEADMAN's chaos never depends on network jitter at minute 3, so the climactic "Double-executions: 1 vs 0" beat lands the same way on every take.
 
 ### 7. Bedrock depth the AWS judge will actually credit
 Cross-**region** (us-east-1→us-west-2) **and** cross-**provider** (Anthropic→Meta→Mistral→Cohere) failover, all on Bedrock, each hop visible in the trace. Not "I enabled fallbacks" — a real, tiered, observable failover story.
@@ -100,7 +112,13 @@ Two of the most screenshot-able artifacts in the whole hackathon: the *"we kille
 | `scripts/run_demo.py` | The split-screen chaos demo + Resilience Scoreboard |
 
 ### The Bedrock fallback chain (tag each tier in the trace)
-`Claude Opus 4.8 @ us-east-1` → `Claude Opus 4.8 @ us-west-2` → `Llama 4 Maverick` → `Mistral Large 3` → `Cohere Command R+` → `semantic cache`. Fallback on 401/403/404/429/5xx; **latency-shed when p99 breaches budget**. The exact Bedrock `modelId` strings (which carry `global.`/`us.` inference-profile prefixes and change as models are deprecated) are resolved at startup via `boto3 ListFoundationModels` / inference-profiles — see `deadman/realmode_ai.resolve_model_id` — so we never ship a stale hardcoded ARN.
+**Aspirational / when-access-granted chain** (applied to the TFY AI Gateway in `infra/ai_gateway.yaml`):
+`Claude Opus 4.8 @ us-east-1` → `Claude Opus 4.8 @ us-west-2` → `Llama 4 Maverick` → `Mistral Large 3` → `Cohere Command R+` → `semantic cache`. On the demo AWS account, `claude-opus-4-8` is not yet invocable (AccessDenied), so this is the target design rather than what serves live requests today.
+
+**Actually-invocable live chain** (direct-Bedrock mode, `DEADMAN_LLM_BACKEND=bedrock`, `config.BEDROCK_FALLBACK_CHAIN`):
+`claude-sonnet-4-6 @ us-east-1` → `claude-haiku-4-5` → `llama3-3-70b` → `nova-2-lite` — every ID verified invocable. Proof: `DEADMAN_LLM_BACKEND=bedrock python3 scripts/real_doctor.py --skip-mcp --skip-dynamodb` → `[PASS] Bedrock completion (direct) - served_by=claude-sonnet-4-6@us-east-1`.
+
+Both chains fall back on 401/403/404/429/5xx; **latency-shed when p99 breaches budget**. Bedrock `modelId` strings carry `global.`/`us.` inference-profile prefixes and change as models are deprecated, so `deadman/realmode_ai.resolve_model_id` (boto3 `ListFoundationModels` / inference-profiles) can resolve the exact id as a hint — note this resolver runs in the bedrock backend, not in the default `LLM_BACKEND=tfy` path, where the TFY gateway owns model selection.
 
 ---
 
@@ -128,7 +146,7 @@ python scripts/run_demo.py
 ```bash
 python scripts/prove_exactly_once.py
 ```
-> *"SIGKILL mid-rollback. Fresh process. Audit log says it already happened. [PASS] — exactly once, across process death."*
+> *"Process-death mid-rollback (durable-state rehydrate). Audit log says it already happened. [PASS] — exactly once, across the crash."*
 
 ### [1:20 — Live War Room, 80 sec]
 Click chaos toggles: **☠ Correlated Blackout** → **⚡ 429 Storm** → **☠ All-Bedrock-Down** → **🔴 KILL mid-rollback**, then hit **RUN**.
@@ -147,7 +165,7 @@ python scripts/real_doctor.py
 | 0:30 | 429 storm + regional outage | us-east-1 down | stalls | latency-shed → us-west-2 |
 | 1:15 | All-Bedrock down | every live tier | dead | Llama→Mistral→Cohere→**cache**; drain authority revoked |
 | 2:00 | Corrupt intermediate output | garbage JSON | reasons on garbage | **Post-Tool guardrail** catches it |
-| **2:45** | **🎯 KILL mid-rollback** | SIGKILL mid-action | re-fires → **DOUBLE** | reads audit log → **skips** → resumes |
+| **2:45** | **🎯 KILL mid-rollback** | process-death mid-action (durable-state rehydrate) | re-fires → **DOUBLE** | reads audit log → **skips** → resumes |
 | 3:30 | Recovery + postmortem | restore | still dead | auto-writes postmortem |
 
 ---

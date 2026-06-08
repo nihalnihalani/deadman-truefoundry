@@ -1,12 +1,19 @@
-"""Day-1 crown jewel: kill DEADMAN mid-rollback, resume in a FRESH agent, assert exactly-once.
+"""Day-1 crown jewel: interrupt DEADMAN mid-rollback, rehydrate, assert exactly-once.
 
     python scripts/prove_exactly_once.py
 
-This is the de-risk gate: if this holds, the project's spine is proven. It kills the
-commander between the side effect and the COMMIT, then rebuilds the agent from the
-durable state + audit log (as a fresh process would) and proves the rollback ran ONCE.
+This is the de-risk gate: if this holds, the project's spine is proven. It simulates
+process-death by raising mid-rollback (between the side effect and the COMMIT), then
+rebuilds the agent from the durable state + audit log — exactly as a fresh process
+would on restart — and proves the rollback ran ONCE. The interruption here is an
+in-process exception modelling the crash; the durable-state rehydrate is the real
+guarantee under test.
 """
 import os
+# Force mock mode BEFORE importing deadman.* so this proof never needs credentials.
+# config.py auto-loads .env via python-dotenv, which does NOT override an env var that
+# is already set — so setting it here wins even when a repo-root .env says MODE=real.
+os.environ["DEADMAN_MODE"] = "mock"
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
