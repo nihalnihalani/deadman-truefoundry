@@ -364,6 +364,7 @@ function updatePanelFromSb(side, sb) {
     fallback_depth: sb.fallback_depth,
     drain_authority: sb.drain_authority,
     guardrail_blocks: sb.guardrail_blocks,
+    state_losses: sb.state_losses,
   });
 }
 
@@ -419,27 +420,40 @@ function setMeta(side, data) {
   const metaEl = el[`${side}Meta`];
   if (!metaEl) return;
 
-  let html = '';
+  // BRAIN = backend + tier (fallback depth)
+  let brainVal = '—';
+  let brainCls = '';
   if (data.backend !== undefined && data.backend !== null) {
-    html += `<span class="meta-item"><span class="meta-label">BACKEND</span>&nbsp;<span class="meta-val">${safe(data.backend)}</span></span>`;
+    brainVal = safe(data.backend);
   }
   if (data.fallback_depth !== undefined && data.fallback_depth !== null) {
     const depth = safeNum(data.fallback_depth);
-    const cls = depth >= 3 ? 'danger' : depth >= 1 ? 'warn' : '';
-    html += `<span class="meta-item"><span class="meta-label">TIER</span>&nbsp;<span class="meta-val ${cls}">${depth}</span></span>`;
+    brainCls = depth >= 3 ? 'danger' : depth >= 1 ? 'warn' : '';
+    brainVal = `${brainVal === '—' ? '—' : brainVal} · T${depth}`;
   }
+
+  // MEMORY = state-loss (0 lost green / 1+ lost red)
+  let memVal = '—';
+  let memCls = '';
+  if (data.state_losses !== undefined && data.state_losses !== null) {
+    const lost = safeNum(data.state_losses);
+    memVal = `${lost} LOST`;
+    memCls = lost > 0 ? 'danger' : 'good';
+  }
+
+  // LEASH = drain ON/OFF
+  let leashVal = '—';
+  let leashCls = '';
   if (data.drain_authority !== undefined && data.drain_authority !== null) {
     const on = String(data.drain_authority).toUpperCase() === 'ON';
-    const cls = on ? 'good' : 'danger';
-    html += `<span class="meta-item"><span class="meta-label">DRAIN</span>&nbsp;<span class="meta-val ${cls}">${on ? 'ON' : 'OFF'}</span></span>`;
+    leashVal = on ? 'ON' : 'OFF';
+    leashCls = on ? 'good' : 'danger';
   }
-  if (data.guardrail_blocks !== undefined && data.guardrail_blocks !== null) {
-    const blocks = safeNum(data.guardrail_blocks);
-    if (blocks > 0) {
-      html += `<span class="meta-item"><span class="meta-label">BLOCKS</span>&nbsp;<span class="meta-val warn">${blocks}</span></span>`;
-    }
-  }
-  if (html) metaEl.innerHTML = html;
+
+  metaEl.innerHTML =
+    `<span class="meta-item"><span class="meta-label">BRAIN</span><span class="meta-val ${brainCls}">${brainVal}</span></span>` +
+    `<span class="meta-item"><span class="meta-label">MEMORY</span><span class="meta-val ${memCls}">${memVal}</span></span>` +
+    `<span class="meta-item"><span class="meta-label">LEASH</span><span class="meta-val ${leashCls}">${leashVal}</span></span>`;
 }
 
 function addTimelineEntry(side, beat, text) {
@@ -511,6 +525,13 @@ function renderScoreboard() {
   renderMetric('backend', naive?.backend, deadman?.backend, false);
   renderMetric('fallback', naive?.fallback_depth, deadman?.fallback_depth, false);
   renderMetric('state-losses', naive?.state_losses, deadman?.state_losses, false);
+  // Hide the State Losses tile entirely when neither side reports the metric
+  const slTile = $('sb-metric-state-losses');
+  if (slTile) {
+    const hasSL = (naive?.state_losses !== undefined && naive?.state_losses !== null) ||
+                  (deadman?.state_losses !== undefined && deadman?.state_losses !== null);
+    slTile.hidden = !hasSL;
+  }
   renderMetric('guardrail-blocks', naive?.guardrail_blocks, deadman?.guardrail_blocks, false);
 
   renderDrainAuthority(naive?.drain_authority, deadman?.drain_authority);
@@ -594,10 +615,9 @@ function buildUI() {
       <div id="header-left">
         <div id="header-title">
           <span class="skull">💀</span>
-          <span class="brand"> DEADMAN</span>
-          <span style="color:var(--label-hi)"> — the agent that survives its own outage</span>
+          <span class="brand">DEADMAN</span>
         </div>
-        <div id="header-tagline">The firefighter is standing in the fire. TrueFoundry is the reason it's still alive.</div>
+        <div id="header-tagline">the agent that survives its own outage</div>
       </div>
       <div id="header-right">
         <div class="conn-status">
@@ -617,25 +637,60 @@ function buildUI() {
 
     <!-- CONTROLS -->
     <section id="controls">
-      <div class="controls-label">Chaos Injectors — deterministic failures, one button each</div>
-      <div class="chaos-buttons" id="chaos-buttons">
-        ${CHAOS_TOGGLES.map(c => `
-          <button class="btn ${c.cls}" id="chaos-btn-${c.id}" title="${c.desc}">${c.label}</button>
-        `).join('')}
-        <button class="btn btn-reset" id="btn-reset">↺ Reset</button>
+      <div class="controls-bar">
+        <div class="chaos-buttons" id="chaos-buttons">
+          ${CHAOS_TOGGLES.map(c => `
+            <button class="btn ${c.cls}" id="chaos-btn-${c.id}" title="${c.desc}">${c.label}</button>
+          `).join('')}
+          <button class="btn btn-reset" id="btn-reset">↺ Reset</button>
+        </div>
+        <div class="demo-controls">
+          <button class="btn btn-primary" id="run-btn">▶  RUN CORRELATED BLACKOUT</button>
+          <label class="fast-toggle">
+            <input type="checkbox" id="fast-check"> Fast replay
+          </label>
+        </div>
       </div>
       <div id="chaos-state">
         ${CHAOS_TOGGLES.map(c => `<span class="off">${c.id.replace(/_/g,' ').toUpperCase()}:off</span>`).join(' &nbsp;|&nbsp; ')}
       </div>
-      <div class="demo-controls">
-        <button class="btn btn-primary" id="run-btn">▶  RUN CORRELATED BLACKOUT</button>
-        <label class="fast-toggle">
-          <input type="checkbox" id="fast-check"> Fast replay (instant)
-        </label>
-      </div>
     </section>
 
+    <!-- HERO STRIP -->
+    <div id="hero">
+      <!-- LEFT: Double-Executions duel -->
+      <div id="headline-block">
+        <span class="sb-incident" id="sb-incident">—</span>
+        <div class="headline-label">Double-Executions</div>
+        <div class="headline-duel">
+          <div class="headline-pair">
+            <span class="headline-who naive">NAIVE</span>
+            <span class="headline-num naive" id="naive-de">0</span>
+          </div>
+          <div class="headline-divider"></div>
+          <div class="headline-pair">
+            <span class="headline-who deadman">DEADMAN</span>
+            <span class="headline-num deadman zero" id="deadman-de">0</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- RIGHT: Leash tile -->
+      <div id="leash-tile">
+        <div class="leash-title">LEASH — Drain Authority</div>
+        <div class="leash-row">
+          <span class="leash-who">NAIVE</span>
+          <span class="drain-badge on" id="drain-naive-badge">ON</span>
+        </div>
+        <div class="leash-row">
+          <span class="leash-who">DEADMAN</span>
+          <span class="drain-badge on" id="drain-deadman-badge">ON</span>
+        </div>
+      </div>
+    </div>
+
     <!-- SPLIT SCREEN -->
+    <div id="arena-caption">BRAIN · MEMORY · LEASH</div>
     <div id="arena">
       <!-- NAIVE Panel -->
       <div class="agent-panel naive" id="naive-panel">
@@ -647,9 +702,7 @@ function buildUI() {
           </div>
           <div class="status-chip chip-idle" id="naive-chip">IDLE</div>
         </div>
-        <div class="panel-meta" id="naive-meta">
-          <span class="meta-item"><span class="meta-label">BACKEND</span>&nbsp;<span class="meta-val">—</span></span>
-        </div>
+        <div class="panel-meta" id="naive-meta"></div>
         <div class="panel-timeline" id="naive-timeline">
           <div class="timeline-empty">Start the demo to see the naive agent's fate…</div>
         </div>
@@ -665,150 +718,61 @@ function buildUI() {
           </div>
           <div class="status-chip chip-idle" id="deadman-chip">IDLE</div>
         </div>
-        <div class="panel-meta" id="deadman-meta">
-          <span class="meta-item"><span class="meta-label">BACKEND</span>&nbsp;<span class="meta-val">—</span></span>
-        </div>
+        <div class="panel-meta" id="deadman-meta"></div>
         <div class="panel-timeline" id="deadman-timeline">
           <div class="timeline-empty">DEADMAN is ready. Start the demo to watch it survive.</div>
         </div>
       </div>
     </div>
 
-    <!-- RESILIENCE SCOREBOARD -->
-    <div id="scoreboard">
-      <div class="sb-header">
-        <div class="sb-title">⚡ Resilience Scoreboard</div>
-        <div class="sb-incident" id="sb-incident">—</div>
-      </div>
-
-      <!-- THE HEADLINE — this IS the pitch -->
-      <div id="headline-block">
-        <span class="headline-label">Double-Executions</span>
-        <span class="headline-sep">//</span>
-        <div class="headline-pair">
-          <span class="headline-who naive">NAIVE</span>
-          <span class="headline-num naive" id="naive-de">0</span>
-        </div>
-        <span class="headline-sep">//</span>
-        <div class="headline-pair">
-          <span class="headline-who deadman">DEADMAN</span>
-          <span class="headline-num deadman zero" id="deadman-de">0</span>
-        </div>
-      </div>
-
-      <!-- Metrics grid -->
+    <!-- FOOTER: compact metric tiles + postmortem -->
+    <footer id="footer">
       <div class="sb-grid">
-
-        <!-- Backend in use -->
         <div class="sb-metric">
           <div class="sb-metric-label">Backend in Use</div>
           <div class="sb-metric-row">
-            <div>
-              <div class="sb-who-label">NAIVE</div>
-              <div class="sb-val naive-val" id="sb-naive-backend">—</div>
-            </div>
-            <div>
-              <div class="sb-who-label">DEADMAN</div>
-              <div class="sb-val deadman-val" id="sb-deadman-backend">—</div>
-            </div>
+            <span class="sb-val naive-val" id="sb-naive-backend">—</span>
+            <span class="sb-val deadman-val" id="sb-deadman-backend">—</span>
           </div>
         </div>
-
-        <!-- Fallback depth -->
         <div class="sb-metric">
           <div class="sb-metric-label">Fallback Depth</div>
           <div class="sb-metric-row">
-            <div>
-              <div class="sb-who-label">NAIVE</div>
-              <div class="sb-val naive-val" id="sb-naive-fallback">—</div>
-            </div>
-            <div>
-              <div class="sb-who-label">DEADMAN</div>
-              <div class="sb-val deadman-val" id="sb-deadman-fallback">—</div>
-            </div>
+            <span class="sb-val naive-val" id="sb-naive-fallback">—</span>
+            <span class="sb-val deadman-val" id="sb-deadman-fallback">—</span>
           </div>
         </div>
-
-        <!-- Guardrail blocks -->
         <div class="sb-metric">
           <div class="sb-metric-label">Guardrail Blocks</div>
           <div class="sb-metric-row">
-            <div>
-              <div class="sb-who-label">NAIVE</div>
-              <div class="sb-val naive-val" id="sb-naive-guardrail-blocks">—</div>
-            </div>
-            <div>
-              <div class="sb-who-label">DEADMAN</div>
-              <div class="sb-val deadman-val" id="sb-deadman-guardrail-blocks">—</div>
-            </div>
+            <span class="sb-val naive-val" id="sb-naive-guardrail-blocks">—</span>
+            <span class="sb-val deadman-val" id="sb-deadman-guardrail-blocks">—</span>
           </div>
         </div>
-
-        <!-- State losses -->
-        <div class="sb-metric">
+        <div class="sb-metric" id="sb-metric-state-losses" hidden>
           <div class="sb-metric-label">State Losses</div>
           <div class="sb-metric-row">
-            <div>
-              <div class="sb-who-label">NAIVE</div>
-              <div class="sb-val naive-val" id="sb-naive-state-losses">—</div>
-            </div>
-            <div>
-              <div class="sb-who-label">DEADMAN</div>
-              <div class="sb-val deadman-val" id="sb-deadman-state-losses">—</div>
-            </div>
+            <span class="sb-val naive-val" id="sb-naive-state-losses">—</span>
+            <span class="sb-val deadman-val" id="sb-deadman-state-losses">—</span>
           </div>
         </div>
-
-        <!-- Drain authority — the WOW flip -->
-        <div class="sb-metric">
-          <div class="sb-metric-label">Drain Authority</div>
-          <div class="drain-block">
-            <div class="drain-row">
-              <div class="drain-side">
-                <span class="drain-who">NAIVE</span>
-                <span class="drain-badge on" id="drain-naive-badge">ON</span>
-              </div>
-            </div>
-            <div class="drain-row">
-              <div class="drain-side">
-                <span class="drain-who">DEADMAN</span>
-                <span class="drain-badge on" id="drain-deadman-badge">ON</span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Survived -->
         <div class="sb-metric">
           <div class="sb-metric-label">Survived</div>
-          <div class="survived-row">
-            <div>
-              <div class="sb-who-label">NAIVE</div>
-              <div class="survived-pill na" id="survived-naive">—</div>
-            </div>
-            <div style="margin-left:12px">
-              <div class="sb-who-label">DEADMAN</div>
-              <div class="survived-pill na" id="survived-deadman">—</div>
-            </div>
+          <div class="sb-metric-row survived-row">
+            <span class="survived-pill na" id="survived-naive">—</span>
+            <span class="survived-pill na" id="survived-deadman">—</span>
           </div>
         </div>
-
-      </div>
-    </div>
-
-    <!-- POSTMORTEM -->
-    <div id="postmortem-section">
-      <div class="pm-header">
-        <div class="pm-title">📋 Incident Postmortem</div>
-        <div class="pm-controls">
-          <input class="pm-input" id="pm-input" type="text" placeholder="incident-42" />
-          <button class="btn btn-pm" id="pm-fetch-btn">Fetch Postmortem</button>
+        <div class="sb-metric pm-metric">
+          <div class="sb-metric-label">Incident Postmortem</div>
+          <div class="pm-controls">
+            <input class="pm-input" id="pm-input" type="text" placeholder="incident-42" />
+            <button class="btn btn-pm" id="pm-fetch-btn">Fetch</button>
+          </div>
         </div>
       </div>
-      <div id="pm-content">
-        <span style="color:var(--label);opacity:0.5">Run the demo, then fetch the auto-generated postmortem from the audit log.</span>
-      </div>
-    </div>
+      <div id="pm-content"></div>
+    </footer>
 
     <!-- TOAST AREA -->
     <div id="toast-area"></div>
