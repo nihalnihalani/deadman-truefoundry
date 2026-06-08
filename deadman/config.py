@@ -3,11 +3,24 @@
 Mock mode (default) runs the whole thing on the stdlib. Set DEADMAN_MODE=real and
 fill .env to route through the real TrueFoundry AI Gateway + MCP Gateway + Bedrock.
 
-Model IDs (June 2026): the fallback chain leads with Claude Opus 4.8 and falls cross-region
-then cross-provider. Because Bedrock deprecates/renames model IDs and newer models use
-inference-profile prefixes (global./us.), real mode resolves the *exact* modelId at startup
-via boto3 (see deadman.realmode_ai.resolve_model_id) rather than trusting a hardcoded string.
-The `model` field below is the FAMILY HINT used for that resolution and for trace tagging.
+Two fallback chains live here, and they are NOT the same:
+
+  * FALLBACK_CHAIN — the ASPIRATIONAL / narrative chain (Claude Opus 4.8 -> Llama 4
+    Maverick -> Mistral Large 3 -> Cohere Command R+). This is the design we apply to
+    the TrueFoundry AI Gateway (infra/ai_gateway.yaml) and the chain we'd run once
+    Bedrock access to those exact model IDs is granted. On the demo AWS account today,
+    claude-opus-4-8 returns AccessDenied and those exact IDs are not invocable — so this
+    chain is the target state, not what currently serves live requests.
+
+  * BEDROCK_FALLBACK_CHAIN — the chain that ACTUALLY runs in direct-Bedrock mode
+    (LLM_BACKEND=bedrock): claude-sonnet-4-6 -> claude-haiku-4-5 -> llama3-3-70b ->
+    nova-2-lite. Every ID here has been verified invocable from this account.
+
+Model-ID resolution: Bedrock deprecates/renames model IDs and newer models use
+inference-profile prefixes (global./us.). deadman.realmode_ai.resolve_model_id() can
+resolve the *exact* modelId at startup via boto3 as a hint — note it is used by the
+bedrock backend, not in the default LLM_BACKEND=tfy path (the TFY gateway owns model
+selection there). The `model` field below is the best-known explicit id / family hint.
 """
 from __future__ import annotations
 
@@ -36,7 +49,11 @@ class TierConfig(TypedDict):
     provider: str
 
 
-# The Bedrock fallback chain — each tier is tagged in the AI Gateway trace.
+# ASPIRATIONAL Bedrock fallback chain — the opus-led narrative chain applied to the TFY
+# AI Gateway (infra/ai_gateway.yaml) and the design we'd run once access is granted.
+# NOTE: claude-opus-4-8 is NOT currently invocable on the demo account (AccessDenied),
+# so this chain does not serve live requests today — see BEDROCK_FALLBACK_CHAIN below for
+# the chain that actually runs in direct-Bedrock mode. Each tier is tagged in the trace.
 # `family` is the resolution hint (substring matched against ListFoundationModels / inference
 # profiles); `model` is the best-known explicit id (used as-is if resolution is unavailable).
 # tier 0 -> 1 is the literal May 7-8 2026 us-east-1 cross-region failover.
@@ -57,11 +74,12 @@ SEMANTIC_CACHE_TIER = 5  # last resort: the "runbook brain"
 # Only consulted when MODE == "real"; mock mode uses the in-process chain either way.
 LLM_BACKEND = os.getenv("DEADMAN_LLM_BACKEND", "tfy")
 
-# Direct-Bedrock fallback chain (used when LLM_BACKEND == "bedrock"). Unlike FALLBACK_CHAIN
-# above — which is the *narrative* chain led by Claude Opus 4.8 and resolved through the TFY
-# gateway — every `model` here is an exact Bedrock inference-profile id that has been verified
-# invocable from this account. It is a cross-provider chain so a single provider's outage or
-# capacity wall sheds to the next tier rather than failing the incident.
+# Direct-Bedrock fallback chain (used when LLM_BACKEND == "bedrock"). This is the chain that
+# ACTUALLY runs live today. Unlike FALLBACK_CHAIN above — which is the aspirational chain led
+# by Claude Opus 4.8 (not yet invocable on the demo account) — every `model` here is an exact
+# Bedrock inference-profile id that has been verified invocable from this account. It is a
+# cross-provider chain so a single provider's outage or capacity wall sheds to the next tier
+# rather than failing the incident.
 BEDROCK_FALLBACK_CHAIN: list[TierConfig] = [
     {"tier": 0, "family": "claude-sonnet-4-6", "model": "us.anthropic.claude-sonnet-4-6", "region": "us-east-1", "provider": "anthropic"},
     {"tier": 1, "family": "claude-haiku-4-5", "model": "us.anthropic.claude-haiku-4-5-20251001-v1:0", "region": "us-east-1", "provider": "anthropic"},

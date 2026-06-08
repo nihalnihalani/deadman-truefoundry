@@ -7,6 +7,14 @@
 # NOTE: field names below follow TrueFoundry's documented gateway config shape; verify
 # against your tenant's current schema (docs: truefoundry.com/docs/ai-gateway).
 #
+# ⚠️ ACCESS STATUS (read before you assume this serves traffic today):
+#   This is the ASPIRATIONAL / when-access-granted chain led by Claude Opus 4.8. On the demo
+#   AWS account, claude-opus-4-8 is NOT invocable (real AccessDenied) and the exact Opus/
+#   Llama-4/Mistral-Large-3/Command-R+ IDs below are not yet available. The chain that
+#   ACTUALLY runs live today is the direct-Bedrock chain in deadman.config.BEDROCK_FALLBACK_CHAIN:
+#     claude-sonnet-4-6 -> claude-haiku-4-5 -> llama3-3-70b -> nova-2-lite (all verified invocable).
+#   The design here is real and applies cleanly the moment access is granted; access is the only gap.
+#
 # MODEL IDs (June 2026):
 #   - The `model` field uses Bedrock's {provider-account}/{model} format for newer models,
 #     or the classic `provider.model-version:N` ARN suffix for GA models.
@@ -32,9 +40,10 @@ type: gateway-virtual-model
 
 # ---- the Bedrock fallback chain (each tier tagged in the trace) ----
 targets:
-  - id: claude-use1                       # tier 0 — primary brain
+  - id: claude-use1                       # tier 0 — primary brain (ASPIRATIONAL: not invocable today)
     provider: aws-bedrock
-    # Claude Opus 4.8 (released May 28 2026, 1M ctx) — us-east-1
+    # Claude Opus 4.8 (released May 28 2026, 1M ctx) — us-east-1.
+    # NOT invocable on the demo account (AccessDenied); enabled once access is granted.
     # Best-known id; exact id resolved at runtime via boto3 (inference profile preferred).
     model: anthropic.claude-opus-4-8-20260528-v1:0
     region: us-east-1
