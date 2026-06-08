@@ -7,7 +7,7 @@ ruff>=0.3.0
 
 # Type checking
 mypy>=1.9.0
-types-requests>=2.31.0    # stubs for the `requests` library used in realmode_mcp
+types-requests>=2.33.0.20260518    # stubs for the `requests` library used in realmode_mcp
 
 # Testing
 pytest>=8.0
