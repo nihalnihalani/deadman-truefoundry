@@ -116,6 +116,16 @@ env:
   DEADMAN_P99_BUDGET_MS: "1500"
   DEADMAN_REVOKE_AT_DEPTH: "2"
   DEADMAN_MIN_REPLICA_FLOOR: "2"
+  # Rate limiter for POST /incident (per client IP). Default 0=disabled; set 10 in prod.
+  DEADMAN_RATE_LIMIT_RPS: "10"
+  # Burst capacity; defaults to 2×RPS when unset.
+  DEADMAN_RATE_LIMIT_BURST: "20"
+  # Seconds to drain in-flight handlers before process exit.
+  DEADMAN_DRAIN_TIMEOUT_SECONDS: "10"
+  # DynamoDB TTL retention (seconds); 0 disables. Default 2592000 = 30 days.
+  DEADMAN_STATE_TTL_SECONDS: "2592000"
+  # Directory for the file state backend (unused when STATE_BACKEND=dynamodb).
+  DEADMAN_STATE_DIR: ".deadman_state"
 
 # ---------------------------------------------------------------------------
 # Secret environment (Kubernetes Secret)

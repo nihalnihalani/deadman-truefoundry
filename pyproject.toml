@@ -51,30 +51,17 @@ indent-style = "space"
 line-ending = "auto"
 
 # ---------------------------------------------------------------------------
-# Mypy — lenient baseline (tighten incrementally via overrides)
+# Mypy — real-path modules are now type-checked (no per-module ignore_errors).
+# Function bodies are inspected (check_untyped_defs); only third-party stubs skipped.
 # ---------------------------------------------------------------------------
 [tool.mypy]
 python_version = "3.12"
-# Global lenient baseline — the goal is a green gate, not a wall of errors.
 ignore_missing_imports = true
-check_untyped_defs = false
-# Do NOT add disallow_untyped_defs = true here until the codebase is annotated.
+check_untyped_defs = true
 warn_return_any = false
 warn_unused_ignores = false
 # Only type-check the application package.
 files = ["deadman"]
-
-# Per-module overrides for files with existing type errors that pre-date this
-# CI setup. These will be removed as the respective modules are fixed.
-[[tool.mypy.overrides]]
-module = [
-    "deadman.config",
-    "deadman.realmode_ai",
-    "deadman.ai_gateway",
-    "deadman.webhook",
-    "deadman.realmode_mcp",
-]
-ignore_errors = true
 
 # ---------------------------------------------------------------------------
 # Pytest — migrated from pytest.ini (that file has been deleted)

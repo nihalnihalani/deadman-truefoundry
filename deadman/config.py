@@ -14,27 +14,37 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any
+from typing import Any, Callable, TypedDict
 
+_load_dotenv: Callable[..., bool] | None
 try:
-    from dotenv import load_dotenv
+    from dotenv import load_dotenv as _load_dotenv
 except ImportError:  # mock-mode demo scripts must keep working on the stdlib
-    load_dotenv = None
+    _load_dotenv = None
 
-if load_dotenv is not None:
-    load_dotenv()
+if _load_dotenv is not None:
+    _load_dotenv()
 
 MODE = os.getenv("DEADMAN_MODE", "mock")
+
+class TierConfig(TypedDict):
+    """One tier in the Bedrock fallback chain."""
+    tier: int
+    family: str
+    model: str
+    region: str
+    provider: str
+
 
 # The Bedrock fallback chain — each tier is tagged in the AI Gateway trace.
 # `family` is the resolution hint (substring matched against ListFoundationModels / inference
 # profiles); `model` is the best-known explicit id (used as-is if resolution is unavailable).
 # tier 0 -> 1 is the literal May 7-8 2026 us-east-1 cross-region failover.
-FALLBACK_CHAIN = [
+FALLBACK_CHAIN: list[TierConfig] = [
     {"tier": 0, "family": "claude-opus-4-8", "model": "anthropic.claude-opus-4-8", "region": "us-east-1", "provider": "anthropic"},
     {"tier": 1, "family": "claude-opus-4-8", "model": "anthropic.claude-opus-4-8", "region": "us-west-2", "provider": "anthropic"},
     {"tier": 2, "family": "llama4-maverick", "model": "meta.llama4-maverick-17b-instruct-v1:0", "region": "us-west-2", "provider": "meta"},
-    {"tier": 3, "family": "mistral-large", "model": "mistral.mistral-large-2407-v1:0", "region": "us-west-2", "provider": "mistral"},
+    {"tier": 3, "family": "mistral-large-3", "model": "mistral.mistral-large-3-2506-v1:0", "region": "us-west-2", "provider": "mistral"},
     {"tier": 4, "family": "command-r-plus", "model": "cohere.command-r-plus-v1:0", "region": "us-west-2", "provider": "cohere"},
 ]
 SEMANTIC_CACHE_TIER = 5  # last resort: the "runbook brain"
@@ -213,6 +223,13 @@ def production_issues() -> list[dict[str, Any]]:
                 "severity": "warning",
                 "field": "DEADMAN_STATE_BACKEND",
                 "message": "file backend is single-host only; use dynamodb for multi-replica production",
+            })
+
+        if float(os.getenv("DEADMAN_RATE_LIMIT_RPS", "0")) <= 0:
+            issues.append({
+                "severity": "warning",
+                "field": "DEADMAN_RATE_LIMIT_RPS",
+                "message": "rate limiting is disabled in production; set DEADMAN_RATE_LIMIT_RPS=10 to enable",
             })
 
     return issues

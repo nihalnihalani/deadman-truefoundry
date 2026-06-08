@@ -161,6 +161,30 @@ env:
   - name: DEADMAN_MIN_REPLICA_FLOOR
     value: "2"
 
+  # ---- Rate limiting -------------------------------------------------------
+  # Token-bucket rate limiter for POST /incident (per client IP).
+  # Default 0 = disabled. Set to 10 in production to prevent alert storms.
+  - name: DEADMAN_RATE_LIMIT_RPS
+    value: "10"
+
+  # Burst capacity; defaults to 2×RPS when unset. Override only if needed.
+  - name: DEADMAN_RATE_LIMIT_BURST
+    value: "20"
+
+  # ---- Graceful shutdown ---------------------------------------------------
+  # Seconds to drain in-flight /incident handlers before the process exits.
+  - name: DEADMAN_DRAIN_TIMEOUT_SECONDS
+    value: "10"
+
+  # ---- State TTL & directory -----------------------------------------------
+  # DynamoDB TTL retention in seconds (default 2592000 = 30 days; 0 disables).
+  - name: DEADMAN_STATE_TTL_SECONDS
+    value: "2592000"
+
+  # Directory for the file-based state backend (unused here since STATE_BACKEND=dynamodb).
+  - name: DEADMAN_STATE_DIR
+    value: ".deadman_state"
+
   # ---- Secret env vars: referenced from TFY Secrets ------------------------
   # Each secretRef block pulls the value from a named TFY Secret.
   # Adjust <secret-name-or-fqn> to match the secret names you created above,
