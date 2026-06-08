@@ -132,7 +132,7 @@ We are deliberately honest about this, because the honesty *is* the resilience s
 
 ## 8. Production readiness
 
-- **382 tests**, all passing (`python3 -m pytest`).
+- **359 tests passing** (1 skipped) — `python3 -m pytest`.
 - **CI** (`.github/workflows/ci.yml`): ruff (lint), mypy (type-check), pytest across **Python 3.12 / 3.13 / 3.14** with coverage, **pip-audit** (dependency CVEs), **bandit** (static security), Docker build + **Trivy** image scan.
 - **Real-mode doctor** (`scripts/real_doctor.py`): a safe, non-destructive wiring check — validates readiness config, sends one small completion (TFY gateway *or* direct Bedrock), lists MCP tools, and verifies the DynamoDB table when enabled.
 - **Operational surface**: `/healthz` (liveness), `/readyz` (mode-aware readiness, 503 while draining), `/metrics` (Prometheus), HMAC/Bearer auth on `/incident`, configurable rate limiting, graceful in-flight drain, CORS locked to dev origins, OTel spans + audit export.
