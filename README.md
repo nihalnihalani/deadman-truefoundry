@@ -28,6 +28,18 @@ No API keys, no install — the mock gateways + a file-backed durable store let 
 demos above force `DEADMAN_MODE=mock` at the top of the script (it wins over any `.env`), so
 they need no credentials and run green regardless of your real-mode config.
 
+### Run the whole app with one command — `./run.sh`
+```bash
+./run.sh                       # full end-to-end boot, follows .env (real mode if configured)
+DEADMAN_MODE=mock ./run.sh     # force the no-credentials mock stack
+```
+`run.sh` does **every step** for you: loads `.env`, creates `.venv` + installs
+`requirements.txt`, starts the local safe MCP server (real mode), runs the `real_doctor`
+wiring preflight, then launches the webhook with **DEBUG-level logging** streamed to the
+console and `./logs/`. Ctrl-C tears everything down cleanly. Handy overrides:
+`DEADMAN_PORT=`, `DEADMAN_RUN_PREFLIGHT=0` (skip the billed preflight call),
+`RUN_SH_HEALTHCHECK_ONLY=1` (boot-and-exit smoke test), `DEADMAN_TRACE=1` (bash xtrace).
+
 **Live-Bedrock proof (evidence the real path works).** With AWS creds configured:
 ```bash
 DEADMAN_LLM_BACKEND=bedrock python3 scripts/real_doctor.py --skip-mcp --skip-dynamodb
