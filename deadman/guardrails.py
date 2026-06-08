@@ -28,6 +28,20 @@ class GuardrailBlock(Exception):
     """Raised when a pre- or post-tool guardrail rejects a call or its result."""
 
 
+class GatewayGuardrailBlock(GuardrailBlock):
+    """Raised when the TFY AI Gateway blocks an LLM call at its own guardrail layer.
+
+    This is the input-side counterpart to the Pre/Post-Tool guardrails above: it
+    corresponds to the gateway-enforced rules declared in infra/guardrails.yaml that
+    have no Python detector (notably ``block-prompt-injection``). The real-mode AI
+    client (deadman.realmode_ai) detects a guardrail violation in the gateway's error
+    response and raises this so the incident commander can treat hostile/blocked input
+    as a *handled* failure — degrade to a safe hold — rather than crashing or, worse,
+    reasoning on injected content. Subclasses GuardrailBlock so existing handlers that
+    already catch guardrail blocks keep working.
+    """
+
+
 class ScopeDenied(Exception):
     """Raised when a destructive tool is outside the agent's current allowed scope."""
 

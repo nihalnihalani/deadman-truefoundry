@@ -114,6 +114,9 @@ class Deadman:
         self.diag_key = action_key(self.incident_id, "cw.get_metrics", "read")
         self.revert_key = action_key(self.incident_id, "revert_pr", "PR-1337")
         self.cordon_key = action_key(self.incident_id, "cordon_drain", "prod-node-7")
+        # Input-side (AI Gateway) guardrail blocks — counted separately from the MCP
+        # tool guardrail blocks so the scoreboard tally includes both layers.
+        self.input_guardrail_blocks = 0
 
     def _scope(self) -> set:
         return self.agentgw.allowed_scope(self.ai.max_depth)
@@ -167,6 +170,13 @@ class Deadman:
                 self.ai.complete("decide the mitigation: revert the bad deploy PR-1337")
         except ModelOutage:
             sb.notes.append("all tiers + cold cache down — degraded to safe hold")
+        except _guardrails.GatewayGuardrailBlock as e:
+            # The TFY AI Gateway tripped an input guardrail (e.g. prompt-injection in
+            # hostile log/incident content). Treat it as a handled failure: never reason
+            # on injected input — degrade to a safe hold and record the block.
+            _metrics.record_guardrail_block("llm.input")
+            self.input_guardrail_blocks += 1
+            sb.notes.append(f"AI Gateway guardrail blocked hostile input -> safe hold ({e})")
 
         sb.backend = "tier-%d" % self.ai.max_depth
         sb.fallback_depth = self.ai.max_depth
@@ -218,7 +228,12 @@ class Deadman:
 
         # Re-plan on the (now deeper) fallback chain — in real mode this naturally surfaces
         # whatever depth the TFY AI Gateway resolved based on live Bedrock availability.
-        self.ai.complete("re-plan mitigation under a deeper outage")
+        try:
+            self.ai.complete("re-plan mitigation under a deeper outage")
+        except _guardrails.GatewayGuardrailBlock as e:
+            _metrics.record_guardrail_block("llm.input")
+            self.input_guardrail_blocks += 1
+            sb.notes.append(f"AI Gateway guardrail blocked re-plan input -> safe hold ({e})")
         scope2 = self._scope()
         sb.fallback_depth = self.ai.max_depth
         sb.backend = "tier-%d" % self.ai.max_depth
@@ -247,7 +262,7 @@ class Deadman:
                     "— destructive scope revoked"
                 )
 
-        sb.guardrail_blocks = self.mcp.guardrail_blocks
+        sb.guardrail_blocks = self.mcp.guardrail_blocks + self.input_guardrail_blocks
         sb.double_executions = max(self.world.count("revert_pr") - 1, 0)
         sb.survived = True
         sb.notes.append("incident resolved; postmortem written from the audit log")
