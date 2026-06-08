@@ -11,12 +11,30 @@ profile ids from a family hint string, so we never ship a stale hardcoded ARN.
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
 import deadman.config as config
+from deadman.guardrails import GatewayGuardrailBlock
 
 log = logging.getLogger(__name__)
+
+# Substrings that mark a gateway response as a guardrail block rather than a transport
+# failure. TFY's exact error shape may vary by tenant version, so detection is keyword +
+# header based and deliberately defensive — same philosophy as the header parsing below.
+_GUARDRAIL_MARKERS = (
+    "guardrail",
+    "prompt injection",
+    "prompt-injection",
+    "blocked by",
+    "content blocked",
+    "policy violation",
+    "flagged",
+    "input was rejected",
+)
+_GUARDRAIL_HEADERS = ("x-tfy-guardrail", "x-tfy-guardrail-action", "x-tfy-blocked")
+_GUARDRAIL_HEADER_PASS_VALUES = {"", "none", "allow", "allowed", "pass", "passed", "ok"}
 
 RESILIENT_MODEL = config.TFY_RESILIENT_MODEL
 
@@ -123,6 +141,37 @@ def _header(headers: Any, name: str) -> str | None:
     return None
 
 
+def _is_guardrail_violation(exc: Any) -> bool:
+    """Best-effort: did the gateway reject this call at its guardrail layer?
+
+    Distinguishes a guardrail block (e.g. block-prompt-injection in infra/guardrails.yaml)
+    from an ordinary transport/availability failure, so the caller can degrade to a safe
+    hold instead of blindly retrying hostile input. Inspects, in order:
+      • an explicit x-tfy-guardrail* response header (non-pass value), then
+      • guardrail keywords in the error message / JSON body.
+    Never raises — an unrecognised error shape simply returns False (treated as transport).
+    """
+    try:
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None)
+        for name in _GUARDRAIL_HEADERS:
+            val = _header(headers, name)
+            if val is not None and val.strip().lower() not in _GUARDRAIL_HEADER_PASS_VALUES:
+                return True
+
+        text = str(getattr(exc, "message", "") or exc).lower()
+        body = getattr(exc, "body", None)
+        if body is not None:
+            try:
+                text += " " + json.dumps(body, default=str).lower()
+            except (TypeError, ValueError):
+                text += " " + str(body).lower()
+        return any(marker in text for marker in _GUARDRAIL_MARKERS)
+    except Exception:  # noqa: BLE001 — detection must never mask the original error
+        log.debug("guardrail-violation detection failed; treating as transport error", exc_info=True)
+        return False
+
+
 def complete(prompt: str) -> dict:
     """One governed completion through the TFY AI Gateway virtual model.
 
@@ -139,7 +188,9 @@ def complete(prompt: str) -> dict:
         }
 
     Raises:
-        openai.OpenAIError  — on hard gateway failure (caller should catch)
+        GatewayGuardrailBlock  — when the gateway blocks the call at its guardrail layer
+                                 (e.g. prompt-injection detected); caller should degrade.
+        openai.OpenAIError     — on hard gateway/transport failure (caller should catch)
     """
     config.require_ai_gateway_config()
 
@@ -153,11 +204,21 @@ def complete(prompt: str) -> dict:
     )
 
     # with_raw_response gives us access to response headers alongside the parsed body.
-    raw_response = client.chat.completions.with_raw_response.create(
-        model=config.TFY_RESILIENT_MODEL,
-        temperature=0,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    # A gateway guardrail block surfaces as an OpenAI API error; translate it into a
+    # typed GatewayGuardrailBlock so the commander handles it as a guardrail event, not
+    # an outage. Genuine transport/availability errors are re-raised unchanged.
+    try:
+        raw_response = client.chat.completions.with_raw_response.create(
+            model=config.TFY_RESILIENT_MODEL,
+            temperature=0,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except openai.OpenAIError as exc:
+        if _is_guardrail_violation(exc):
+            raise GatewayGuardrailBlock(
+                f"TFY AI Gateway guardrail blocked the completion: {str(exc)[:300]}"
+            ) from exc
+        raise
 
     completion = raw_response.parse()
     headers = raw_response.headers  # httpx Headers object

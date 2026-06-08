@@ -49,6 +49,29 @@ FALLBACK_CHAIN: list[TierConfig] = [
 ]
 SEMANTIC_CACHE_TIER = 5  # last resort: the "runbook brain"
 
+# Real-mode LLM backend selector:
+#   "tfy"     (default) — route completions through the TrueFoundry AI Gateway (OpenAI-
+#                         compatible endpoint), which itself fans out to Bedrock.
+#   "bedrock"           — call AWS Bedrock directly via boto3 using ambient AWS creds,
+#                         walking BEDROCK_FALLBACK_CHAIN. No TFY AI Gateway required.
+# Only consulted when MODE == "real"; mock mode uses the in-process chain either way.
+LLM_BACKEND = os.getenv("DEADMAN_LLM_BACKEND", "tfy")
+
+# Direct-Bedrock fallback chain (used when LLM_BACKEND == "bedrock"). Unlike FALLBACK_CHAIN
+# above — which is the *narrative* chain led by Claude Opus 4.8 and resolved through the TFY
+# gateway — every `model` here is an exact Bedrock inference-profile id that has been verified
+# invocable from this account. It is a cross-provider chain so a single provider's outage or
+# capacity wall sheds to the next tier rather than failing the incident.
+BEDROCK_FALLBACK_CHAIN: list[TierConfig] = [
+    {"tier": 0, "family": "claude-sonnet-4-6", "model": "us.anthropic.claude-sonnet-4-6", "region": "us-east-1", "provider": "anthropic"},
+    {"tier": 1, "family": "claude-haiku-4-5", "model": "us.anthropic.claude-haiku-4-5-20251001-v1:0", "region": "us-east-1", "provider": "anthropic"},
+    {"tier": 2, "family": "llama3-3-70b", "model": "us.meta.llama3-3-70b-instruct-v1:0", "region": "us-east-1", "provider": "meta"},
+    {"tier": 3, "family": "nova-2-lite", "model": "us.amazon.nova-2-lite-v1:0", "region": "us-east-1", "provider": "amazon"},
+]
+
+# Max output tokens for direct-Bedrock Converse calls.
+BEDROCK_MAX_TOKENS = int(os.getenv("DEADMAN_BEDROCK_MAX_TOKENS", "1024"))
+
 # Latency budget (ms). Breaching p99 sheds to the next tier BEFORE a hard 5xx.
 P99_LATENCY_BUDGET_MS = int(os.getenv("DEADMAN_P99_BUDGET_MS", "1500"))
 
@@ -172,6 +195,13 @@ def production_issues() -> list[dict[str, Any]]:
             "message": "must be one of 'auto', 'mcp', or 'rest'",
         })
 
+    if LLM_BACKEND not in {"tfy", "bedrock"}:
+        issues.append({
+            "severity": "error",
+            "field": "DEADMAN_LLM_BACKEND",
+            "message": "must be either 'tfy' or 'bedrock'",
+        })
+
     if STATE_BACKEND == "dynamodb" and not DYNAMODB_TABLE:
         issues.append({
             "severity": "error",
@@ -180,11 +210,16 @@ def production_issues() -> list[dict[str, Any]]:
         })
 
     if is_real():
+        # TFY_API_KEY authenticates BOTH the AI Gateway and the MCP Gateway, so it is
+        # required regardless of LLM backend (the MCP tool layer always uses TFY).
+        # TFY_GATEWAY_BASE_URL is only needed when the LLM backend is the TFY gateway;
+        # the direct-Bedrock backend authenticates with ambient AWS credentials instead.
         required = {
             "TFY_API_KEY": TFY_API_KEY,
-            "TFY_GATEWAY_BASE_URL": TFY_GATEWAY_BASE_URL,
             "TFY_MCP_GATEWAY_URL": TFY_MCP_GATEWAY_URL,
         }
+        if LLM_BACKEND == "tfy":
+            required["TFY_GATEWAY_BASE_URL"] = TFY_GATEWAY_BASE_URL
         for field, value in required.items():
             if not value:
                 issues.append({

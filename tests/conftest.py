@@ -20,6 +20,11 @@ def isolated_state(tmp_path, monkeypatch):
     # Also ensure MODE is mock (tests never make real network calls)
     monkeypatch.setattr(config, "MODE", "mock")
     monkeypatch.setattr(config, "STATE_BACKEND", "file")
+    # Isolate from a developer's local .env: config loads .env at import, so a value like
+    # TFY_MCP_TRANSPORT=mcp would otherwise leak into tests that assume the "auto"/REST
+    # default and silently flip them onto the live fastmcp transport (real network call).
+    # Pin the code default; tests that need a specific transport monkeypatch it themselves.
+    monkeypatch.setattr(config, "TFY_MCP_TRANSPORT", "auto")
     monkeypatch.delenv("DEADMAN_ENABLE_DEMO", raising=False)
     monkeypatch.delenv("DEADMAN_WEBHOOK_SECRET", raising=False)
     yield state_dir

@@ -37,11 +37,18 @@ class AIGateway:
     def complete(self, prompt: str) -> Completion:
         """Try each tier in order; shed on outage OR latency-budget breach; cache last."""
         if config.MODE == "real":
-            # The real TFY AI Gateway does fallback/retry/cache; we just call the virtual model.
-            # realmode_ai returns richer metadata (fallback_depth, from_cache) so the Agent
-            # Gateway auto-leash works correctly in real mode.
-            from deadman import realmode_ai
-            r = realmode_ai.complete(prompt)
+            # Two interchangeable real-mode backends (selected by DEADMAN_LLM_BACKEND):
+            #   "tfy"     — the TFY AI Gateway does fallback/retry/cache; we call the
+            #               virtual model and read x-tfy-* headers for routing metadata.
+            #   "bedrock" — call AWS Bedrock directly via boto3, walking the fallback chain.
+            # Both return the same dict (text, served_by, fallback_depth, from_cache) so the
+            # Agent Gateway auto-leash works correctly regardless of backend.
+            if config.LLM_BACKEND == "bedrock":
+                from deadman import bedrock_ai
+                r = bedrock_ai.complete(prompt)
+            else:
+                from deadman import realmode_ai
+                r = realmode_ai.complete(prompt)
             # Track degradation depth so AgentGateway can revoke destructive authority.
             self.max_depth = max(self.max_depth, r["fallback_depth"])
             if r["fallback_depth"] > 0:
