@@ -15,10 +15,10 @@ That one number is the whole pitch. **It already runs** — see [Quickstart](#-q
 git clone <this-repo> deadman-truefoundry && cd deadman-truefoundry
 
 # Day-1 crown jewel: kill the agent mid-rollback, resume, ASSERT exactly-once
-python scripts/prove_exactly_once.py
+python3 scripts/prove_exactly_once.py
 
 # The split-screen chaos demo: naive agent vs DEADMAN + the Resilience Scoreboard
-python scripts/run_demo.py
+python3 scripts/run_demo.py
 
 # Full local readiness gate: pytest + exactly-once proof + demo + compose config
 make check
@@ -151,12 +151,12 @@ Open `http://localhost:8080` in the browser.
 
 ### [0:20 — The Proof, 60 sec]
 ```bash
-python scripts/run_demo.py
+python3 scripts/run_demo.py
 ```
 > *"NAIVE hits the outage, loses state, double-executes the rollback — double-executions = **1**. DEADMAN rehydrates from its audit log, sees the rollback already ran, skips it — double-executions = **0**."*
 
 ```bash
-python scripts/prove_exactly_once.py
+python3 scripts/prove_exactly_once.py
 ```
 > *"Process-death mid-rollback (durable-state rehydrate). Audit log says it already happened. [PASS] — exactly once, across the crash."*
 

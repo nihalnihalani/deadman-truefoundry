@@ -88,7 +88,7 @@ split-screen UI updates on camera. (Use `--base-url` if not on :8080.)
 
 ## Credibility close (say this at 2:50)
 
-> **"DEADMAN is real, tested, and ships. 364 tests passing, CI green, real-mode
+> **"DEADMAN is real, tested, and ships. 359 tests passing, CI green, real-mode
 > wired to TrueFoundry's AI Gateway, MCP Gateway, and AWS Bedrock with guardrails.
 > The naive agent corrupted production. DEADMAN didn't. We ship Monday."**
 
@@ -126,7 +126,7 @@ python3 scripts/demo_drive.py --pause 0.5   # drives all endpoints, prints headl
 
 - [ ] **Your name / team name** in the credibility close and video intro.
 - [ ] **Repo / demo URL** to show on the closing card.
-- [ ] **Test count** — script says **364**; re-run `python3 -m pytest -q` and update the number if it changed.
+- [ ] **Test count** — script says **359** (verified: `359 passed, 1 skipped`); re-run `python3 -m pytest -q` and update if it changed.
 - [ ] **"ships Monday"** — adjust the date to your actual ship target.
 - [ ] Confirm `scripts/bedrock_failover_demo.py` exists and the `--down 2` output matches the narration (built by a teammate; rehearse it once with real creds).
 - [ ] Decide hands-on clicking vs `demo_drive.py` auto-drive and rehearse that path only.
