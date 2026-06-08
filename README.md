@@ -154,9 +154,14 @@ Click chaos toggles: **☠ Correlated Blackout** → **⚡ 429 Storm** → **☠
 
 ### [2:40 — Real Stack, 20 sec]
 ```bash
-python scripts/real_doctor.py
+# Direct AWS Bedrock path — works on the demo account today (no TFY credit needed):
+DEADMAN_LLM_BACKEND=bedrock python3 scripts/real_doctor.py --skip-mcp --skip-dynamodb
+# Live cross-provider failover against real Bedrock:
+python3 scripts/bedrock_failover_demo.py --down 2
 ```
-> *"This runs on TrueFoundry right now. AI Gateway for model resilience. MCP Gateway for governed tool execution with audit trail. All green."*
+> *"And this is real — a live completion against AWS Bedrock, then a real cross-provider failover: I take down the top tiers and it sheds to a model that still answers."*
+
+> **Demo note:** lead the real beat with the direct-Bedrock path above (it runs on the AWS account today). The full TFY AI Gateway beat (`python3 scripts/real_doctor.py`) requires the TrueFoundry tenant to have credit — confirm `[PASS] AI Gateway completion` before narrating "all green" on camera.
 
 ### Beat table (for reference)
 | Time | Beat | Failure | Naive | DEADMAN |
@@ -189,8 +194,9 @@ Ready-to-edit configs ship in [`infra/`](./infra):
    `deadman/realmode_mcp.py` → the MCP Gateway with an `Idempotency-Key` header. `TFY_MCP_TRANSPORT=auto`
    selects the standard MCP transport for the TrueFoundry server URL and keeps a REST shim for local tests.
 4. Run the safe live wiring check. It performs one small model call and lists MCP tools, but never
-   invokes destructive tools:
-   `python scripts/real_doctor.py`
+   invokes destructive tools: `python3 scripts/real_doctor.py`
+   (No TFY credit? Use the direct-Bedrock path:
+   `DEADMAN_LLM_BACKEND=bedrock python3 scripts/real_doctor.py --skip-mcp --skip-dynamodb`.)
 5. Run the webhook a PagerDuty/CloudWatch alarm hits: `uvicorn deadman.webhook:app --port 8080`.
    Set `DEADMAN_WEBHOOK_SECRET` to require a bearer token / HMAC signature on `/incident`, and
    leave `DEADMAN_ENABLE_DEMO` unset (or set it to `0`) so demo + chaos endpoints stay disabled
