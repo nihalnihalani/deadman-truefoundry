@@ -44,7 +44,7 @@ Then open the UI: **http://localhost:8080**
 
 **Env notes**
 - `DEADMAN_MODE=mock` (default): deterministic, offline, no AWS creds needed. Use this for the screen-record.
-- `DEADMAN_MODE=real`: genuine TrueFoundry AI Gateway + Bedrock + MCP Gateway. Needed only for the **live Bedrock failover** segment. Verify wiring first with `python3 scripts/real_doctor.py`.
+- `DEADMAN_MODE=real`: genuine TrueFoundry AI Gateway + Bedrock + MCP Gateway. Needed only for the **live Bedrock failover** segment. Verify wiring with the direct-Bedrock path (works without TFY credit): `DEADMAN_LLM_BACKEND=bedrock python3 scripts/real_doctor.py --skip-mcp --skip-dynamodb`. The full-TFY check (`python3 scripts/real_doctor.py`) needs the TrueFoundry tenant to have credit.
 - Two terminals on screen is ideal: **Terminal A** = server logs (structured JSON), **Terminal B** = the CLI proofs.
 
 ### Optional: auto-drive the UI (hands-free recording)
