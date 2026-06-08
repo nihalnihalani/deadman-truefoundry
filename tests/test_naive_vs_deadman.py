@@ -64,6 +64,35 @@ class TestNaiveVsDeadman:
         assert world.count("revert_pr") == 1
         assert sb.double_executions == 0
 
+    def test_naive_double_execution_is_emergent_not_hardcoded(self, isolated_state):
+        """The double-execution must EMERGE from the lost in-process memory.
+
+        If the naive agent's memory were NOT wiped on restart, its own (in-memory)
+        dedup check would skip the second mitigation and there would be exactly one
+        side effect. That counterfactual proves count==2 is caused by the absent
+        durability, not by two literal hardcoded calls.
+        """
+        world = World()
+        agent = NaiveAgent(world)
+
+        # Counterfactual: with intact memory, the second _mitigate() is a no-op.
+        assert agent._mitigate() is True, "first mitigation should fire the side effect"
+        assert agent._mitigate() is False, (
+            "second mitigation with INTACT memory must dedup (no double-execution)"
+        )
+        assert world.count("revert_pr") == 1, (
+            "with memory retained the naive agent is exactly-once -> proves the double "
+            "execution is caused by the restart memory-wipe, not a hardcoded second call"
+        )
+
+        # Now the real failure path: the restart wipes memory -> the dedup can't fire.
+        agent._restart()
+        assert agent.done_in_memory == [], "restart must wipe the only durability the agent has"
+        assert agent._mitigate() is True, (
+            "after a memory-wiping restart the agent re-fires because it has no way to know"
+        )
+        assert world.count("revert_pr") == 2, "emergent double-execution after memory loss"
+
     def test_naive_vs_deadman_contrast_demo(self, isolated_state):
         """Full contrast: naive >= 1 double executions; deadman == 0."""
         # ---- Naive ----
