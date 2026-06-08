@@ -56,12 +56,20 @@ def _print_human(result: dict[str, Any]) -> None:
 
 
 def _ai_check(prompt: str) -> dict[str, Any]:
-    from deadman import realmode_ai
+    if config.LLM_BACKEND == "bedrock":
+        from deadman import bedrock_ai
 
-    response = realmode_ai.complete(prompt)
+        response = bedrock_ai.complete(prompt)
+        label = "Bedrock completion (direct)"
+    else:
+        from deadman import realmode_ai
+
+        response = realmode_ai.complete(prompt)
+        label = "AI Gateway completion"
+
     text = response.get("text", "")
     return _check(
-        "AI Gateway completion",
+        label,
         True,
         f"served_by={response.get('served_by')} depth={response.get('fallback_depth')} "
         f"cache={response.get('from_cache')}",
