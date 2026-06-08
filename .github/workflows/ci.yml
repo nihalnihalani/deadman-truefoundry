@@ -33,7 +33,7 @@ jobs:
           python-version: "3.12"
 
       - name: Cache pip
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/pip
           key: pip-lint-${{ hashFiles('requirements-dev.txt') }}
@@ -66,7 +66,7 @@ jobs:
           python-version: "3.12"
 
       - name: Cache pip
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/pip
           key: pip-type-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
@@ -98,7 +98,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Cache pip
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/pip
           key: pip-test-${{ matrix.python-version }}-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
@@ -133,7 +133,7 @@ jobs:
           python-version: "3.12"
 
       - name: Cache pip
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/pip
           key: pip-sec-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
