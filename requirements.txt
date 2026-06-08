@@ -28,7 +28,7 @@ openai>=1.30
 boto3>=1.43.18
 
 # Observability — Prometheus /metrics (degrades to no-op stubs if absent)
-prometheus-client>=0.20
+prometheus-client>=0.25.0
 
 # Testing
 pytest>=8.0
